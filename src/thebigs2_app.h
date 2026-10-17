@@ -28,6 +28,7 @@
 #include "first_launch.h"
 #include "frame_stats.h"
 #include "settings.h"
+#include "native_capture.h"
 #if defined(TB2_RENDER_TRACE)
 #include "render_trace.h"
 #endif
@@ -121,6 +122,7 @@ class Thebigs2App : public rex::ReXApp {
                           [this] { RequestQuit("keyboard"); });
     TB2_RegisterRenderDocCaptureBind();
     SetGuestFrameStats(&tb2::GuestFrameStats);
+    tb2::NativeCaptureInit(tb2_user_data_root_ / "captures");
 #if defined(TB2_RENDER_TRACE)
     TB2TraceInit(tb2_user_data_root_ / "traces");
 #endif

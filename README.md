@@ -21,7 +21,7 @@ No game data is included. You need your own dump of the disc.
 | `src/frame_stats.cpp` | Frame-rate counter (F3 overlay, log) and the experimental 60 fps unlock (`frame_rate`) |
 | `src/render_trace.cpp`, `src/renderdoc_capture.cpp` | Debug tooling: render-call trace build (F8), RenderDoc capture (F9) |
 | `docs/native-renderer.md`, `docs/d3d-map.md` | Plan and findings for a native Vulkan renderer (`native-renderer` branch) |
-| `tools/` | Analysis scripts (call graph, string refs, render-trace generator and summary), `atbat.sh` (scripted gameplay frame for rendering checks), `perf/` (GPU command thread benchmark, gdb stack sampler) |
+| `tools/` | Analysis scripts (call graph, string refs, render-trace generator and summary), `atbat.sh` (scripted gameplay frame for rendering checks), `native_capture_run.sh` (shadow captures while it plays), `perf/` (GPU command thread benchmark, gdb stack sampler) |
 | `packaging/` | AppImage recipe (`build-appimage.sh`, desktop file, icon; `PROFILE=steamdeck` for the Deck); Windows cross-build (`build-windows.sh`, `windows/` toolchain file and icon) |
 | `game/` | **Your** extracted disc contents (`default.xex` + data). Git-ignored. |
 | `generated/` | Codegen output — regenerated, never edit by hand |
@@ -392,6 +392,7 @@ close the window through the normal shutdown. F10 can be rebound with the
 | F3 | SDK debug overlay, including the game's frame rate |
 | F4 / F7 / Backtick | SDK settings, achievements and console overlays |
 | F9 | Capture frames in RenderDoc (only when launched from RenderDoc) |
+| F6 | Record a native-renderer shadow capture to `captures/` (development, see `docs/d3d-map.md`) |
 | F8 | Record a render trace (trace build only, `-DTB2_RENDER_TRACE=ON`) |
 
 ## 6. Windows build (cross-compiled on Linux)

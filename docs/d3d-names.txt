@@ -11,8 +11,10 @@
 823BA340 Swap(inner)
 823BA338 Swap?
 823B9E68 Swap(body)?
-823B2A50 RingKickOff?
-823B0E00 RingReserve?
+823B2A50 RingNextSegment
+823B0E00 ResourceListReserve?
+823C5C28 Clear
+823C5B00 Clear(body)
 823B2160 WaitForGpuSpace
 823B3310 PollGpuFence
 
@@ -22,7 +24,7 @@
 823B7788 FlushFetchConstants?
 823B8708 FlushStateGroup?
 823B71B0 FlushRegisters2?
-823B7608 FlushRegisters3?
+823B7608 FlushClipPlanes
 
 # Shader constants and textures/streams (device shadow + dirty masks)
 823BC810 SetVertexShaderConstantF
@@ -30,8 +32,9 @@
 823AF7B0 SetTexture
 823B6068 SetStreamSource?
 823B6188 SetIndices?
-823BCB58 SetVertexShader?
-823BCD18 SetPixelShader?
+823BCB58 SetPixelShader
+823BCD18 SetVertexShader
+823BCEE8 SetVertexDeclaration?
 823B5548 SetSamplerState_A?
 823B56F0 SetSamplerState_B?
 823B5990 SetSamplerState_C?
@@ -54,9 +57,9 @@
 823B47B0 SetRenderState_DepthBias_Off?
 
 # Render targets (renderlib pass setup sub_82495A90 / sub_82496020)
-823B68D0 SetRenderTarget?
-823B6EF8 SetDepthStencilSurface?
-823B6C20 SetViewport?
+823B68D0 SetRenderTarget
+823B6EF8 SetRenderTarget(thunk)
+823B6C20 SetDepthStencilSurface?
 823B67A0 UpdateSurfaceRegisters?
 
 # renderlib (engine)

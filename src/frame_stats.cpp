@@ -27,6 +27,7 @@
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
 
+#include "native_capture.h"
 #include "render_trace.h"
 
 REXCVAR_DEFINE_DOUBLE(fps_log_interval, 0.0, "The Bigs 2/Debug",
@@ -175,8 +176,10 @@ rex::ui::FrameStats GuestFrameStats() {
 extern "C" REX_FUNC(__imp__sub_823BA340);
 extern "C" REX_FUNC(sub_823BA340) {
   TB2_TRACE_HOOKED(0x823BA340);
+  tb2::NativeCaptureOnSwap(base);
   OnSwap();
   __imp__sub_823BA340(ctx, base);
+  tb2::NativeCaptureAfterSwap(base);
   OnSwapReturn();
 }
 

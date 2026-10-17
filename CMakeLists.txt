@@ -30,6 +30,7 @@ set(THEBIGS2_SOURCES
     src/frame_stats.cpp
     src/first_launch.cpp
     src/render_tweaks.cpp
+    src/native_capture.cpp
 )
 
 if(WIN32)

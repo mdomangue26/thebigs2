@@ -1,6 +1,7 @@
 # Native Vulkan renderer — plan and findings
 
-Status: **Phase 0 (mapping) done, phase 1 next.** Work happens on the
+Status: **Phase 0 (mapping) done; phase 1 (shadow capture) validated, resource
+mapping still open.** Work happens on the
 `native-renderer` branch. The game still renders through the SDK's Xenos GPU
 emulator; nothing here changes that yet. Findings: [d3d-map.md](d3d-map.md).
 
@@ -95,12 +96,13 @@ renderer via `OnCreateImmediateDrawer`).
    and call order for every D3D-library and renderlib function. Output:
    [d3d-map.md](d3d-map.md), [d3d-names.txt](d3d-names.txt) and the cut-point
    decision above.
-1. **Shadow capture** *(next)*. Hook the two draw functions, `Resolve`, render
-   target setup and `Swap` without changing behaviour; at each draw, snapshot
-   the dirty parts of the device shadow and record a host-side command stream
-   per frame (targets, state, draws). Check it against the emulator (draw
-   count from `cp_frame_stats`, render targets from a RenderDoc capture). Also
-   confirm the `?` names and map resource creation from a loading trace.
+1. **Shadow capture** *(validated 2026-10-17)*. `src/native_capture.cpp` hooks
+   the two draw functions, `Clear`, `Resolve` and `Swap` without changing
+   behaviour and records each frame as a native renderer would read it, checked
+   against the PM4 stream D3D sends to the GPU: the device shadow holds the
+   complete GPU state at every draw ([d3d-map.md](d3d-map.md#phase-1-shadow-capture-srcnative_capturecpp)).
+   Still open: resource creation (textures, buffers, shaders) from a loading
+   trace, and `BeginTiling`/`EndTiling`.
 2. **Resources**. Textures (format conversion, untiling, mips), vertex/index
    buffers, vertex declarations, shaders translated to SPIR-V, pipeline cache.
 3. **First native pixels**. Draw one simple pass natively — the 2D front end

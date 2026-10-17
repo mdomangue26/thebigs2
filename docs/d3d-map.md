@@ -38,13 +38,20 @@ the draw packet. Device layout found so far:
 | `+16` (u64) | dirty mask: render-state register groups |
 | `+24` (u64) | dirty mask: fetch constants (textures, vertex streams) |
 | `+32` (u64) | dirty mask: more register groups |
-| `+48`.. | flush bookkeeping read by the flush helpers |
-| `+1152 + 24*n` | fetch constants (6 dwords each; textures and vertex buffers) |
-| `+1920` | vertex shader float constants c0–c255 (16 bytes each) |
-| `+6016` | pixel shader float constants c0–c255 |
-| `+10368` | register images, written as PM4 `SET_CONSTANT` blocks: `+10368` = Xenos regs `0x2000..`, `+10444` = `0x2100..`, `+10528` = `0x2180..`, `+10548` = `0x2200..`, `+10596` = `0x2280..`, `+10680` = `0x2300..`, `+10832` = `0x2380..` |
-| `+12552 + 4*s` | texture object per sampler (`SetTexture`: `device[3138 + s]`) |
-| `+13524` / `+13528` | ring buffer write pointer / reserve limit |
+| `+48` / `+52` / `+56` | PM4 ring: **last dword written** (D3D pre-increments: next free = value + 4) / segment limits; `sub_823B2A50` moves to the next segment |
+| `+1152 + 24*n` | fetch constants, 32 slots x 6 dwords (registers `0x4800..`; textures and vertex buffers) |
+| `+1920` | ALU constants, registers `0x4000..`: vertex shader c0–c255, then pixel shader c0–c255 at `+6016` |
+| `+10112` | bool + loop constants (registers `0x4900..0x4927`) |
+| `+10272` | user clip planes `PA_CL_UCP_0..5` (registers `0x2388..0x239F`) |
+| `+10368`.. | register images, one dirty bit per register: `0x2000..0x200F` at `+10368`, `0x2100..0x2114` at `+10444`, `0x2180..0x2184` at `+10528`, `0x2200..0x220B` at `+10548`, `0x2280..0x2294` at `+10596`, `0x2300..0x2325` at `+10680`, `0x2380..0x2387` at `+10832` |
+| `+11824` | vertex declaration? (`sub_823BCEE8`) |
+| `+12448` | render targets 0–3 (`D3DSurface*`, `SetRenderTarget`; also copies the surface's `+28` word into `RB_COLOR_INFO`/`RB_COLORn_INFO`) |
+| `+12464` | depth/stencil surface |
+| `+12552 + 4*s` | texture object per fetch slot (`SetTexture`: `device[3138 + s]`) |
+| `+12700` / `+12704` | pixel shader / vertex shader objects |
+| `+13524` / `+13528` | a separate resource-reference list (not PM4) |
+
+All of this is verified at run time by the shadow capture (below).
 
 So the shadow at draw time **is** the Xenos register state (plus the D3D objects
 behind it). Render states map to the packed register blocks, e.g. `+10548` =
@@ -61,7 +68,8 @@ All draws go through two functions, both called only from renderlib:
 | `824DAA88` DrawIndexedVertices | 0 | 161 | 1,037 | 758 |
 | `824DA698` DrawVertices | 367 | 151 | 303 | 129 |
 | `823C6450` Resolve | 1 | 16 | 16 | 16 |
-| `823B68D0` SetRenderTarget? | 120 | 132 | 132 | 132 |
+| `823C5C28` Clear | 7 | | 8 | |
+| `823B68D0` SetRenderTarget | 120 | 132 | 132 | 132 |
 
 The XDK's other packet builders (`823AFD28`, `823BC6D0`, `823C0328`, ...) are
 never called in these scenes. With predicated tiling (3 tiles for the main scene
@@ -80,7 +88,7 @@ the ~3,640 draws the command processor counted.
 | `823B6068` SetStreamSource? | 1,174 | `82491188` |
 | `823B6188` SetIndices? | 807 | `82491268` |
 | 8 render-state setters (`823B44F0`..`823B46D0`) | 700 each | `82491598` (per material) |
-| `823BCB58` / `823BCD18` SetVertexShader? / SetPixelShader? | ~250 each | `82493850` / `824937D0` |
+| `823BCD18` / `823BCB58` SetVertexShader / SetPixelShader | ~250 each | `824937D0` / `82493850` |
 | sampler state setters (`823B5548`, `823B56F0`, ...) | ~400 | `82490E08` |
 
 Evidence for the names: `SetTexture` stores the texture at `device[3138+s]`,
@@ -115,10 +123,60 @@ These bypass any D3D call wrapper, but land in the shadow that the draw flushes.
   (render target + `Resolve`), `82219148` sets up the scene passes (MSAA and
   tiling, see `src/render_tweaks.cpp`).
 
+## Phase 1: shadow capture (`src/native_capture.cpp`)
+
+F6 (or `kill -s RTMIN+1 <pid>`) records `native_capture_frames` frames to
+`<user data>/captures/native_capture_NNN.txt`: one line per draw (arguments,
+primitive and index count from the draw packet, shaders, render targets and
+surface registers, depth/blend/cull state, bound textures), clear and resolve,
+the frame's render passes, and a validation section. `tools/native_capture_run.sh`
+captures every few seconds while `tools/atbat.sh` plays.
+
+Validation: the capture parses the PM4 packets D3D writes to the ring (draws,
+clears, resolves and everything between, segment by segment) and checks them
+against the shadow decoding above. Over 58 frames (intro video, menus, stadium
+intro, batting, fielding; 28,607 draws), 2026-10-17:
+
+- every hooked draw wrote exactly one draw packet; the only other draw packets
+  are inside `Clear` (8/frame) and `Resolve` (16/frame), both rectangle lists;
+- every register/constant the draw flush wrote equals the shadow value
+  (~270k checks per batting frame), except shader literal constants, which
+  come from memory via `LOAD_ALU_CONSTANT` (pixel c254–c255);
+- the GPU state rebuilt from all packets equals the shadow at every draw
+  (67 million register comparisons, 0 mismatches).
+
+So **a native renderer can read the complete GPU state from the device
+shadow at each draw**. Registers written outside the shadow: `VGT_INDX_OFFSET`
+(`0x2102`, from the draw's arguments), `0x5000–0x5002` (per draw, constant
+`0, 0x25000, 0`; unnamed in the SDK's register table), coherency registers
+`0x0A2F–0x0A31` (cache flushes). One earlier run had a single parse desync
+(1 draw in ~44k, not reproduced since; the capture now logs details if it
+recurs).
+
+### A batting frame (1x, default settings)
+
+From the render passes and resolves in a capture (`si` = `RB_SURFACE_INFO`,
+pitch in the low 14 bits):
+
+1. 24 draws, 320 wide, cleared to magenta -> resolve (environment/reflection?)
+2. 44 draws, 560 wide, no depth -> resolve
+3. 560 wide with depth -> depth resolve + color resolve
+4. 30 depth-only draws, 1600 wide (shadow map) -> depth resolve
+5. main scene, 1280 wide: ~1,080 draws alternating two EDRAM color formats
+   (`RB_COLOR_INFO` format 3 / 12) -> depth + color resolves
+6. post-processing chain 1280 -> 320 -> 80 -> 80 -> 320 -> 160 (1–2 draws each,
+   resolve after each)
+7. HUD/UI: 90 draws into the front-buffer target, final resolve -> Swap
+
+The main scene's surface registers say 1x: the game's 4x MSAA and 3-tile
+predicated tiling are applied by `BeginTiling` / `EndTiling` (three
+`INDIRECT_BUFFER` replays per frame), which a native renderer needs to handle
+explicitly.
+
 ## Open questions
 
-- Confirm the `?` names (arguments against XDK D3D signatures; the render
-  target/depth/viewport group in particular).
+- Confirm the remaining `?` names (render states, samplers, streams).
+- How `BeginTiling`/`EndTiling` set up MSAA and the tiles.
 - Resource creation (textures, vertex/index buffers, shaders) happens at load
   time; map it from a loading-screen trace (`trace_at_start`, or F8 during a
   load with a larger `trace_frames`).

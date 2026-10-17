@@ -15,6 +15,11 @@
 //   - a mirror of the GPU state rebuilt from all parsed packets must match the
 //     shadow at every draw (nothing reaches the GPU behind the shadow's back).
 //
+// Also logs BeginTiling/EndTiling (with every packet they write), and a
+// resource table per frame: textures, vertex/index buffers and shader
+// microcode the draws use, hashed and compared with the previous captured
+// frame (native_capture_frames >= 2) to tell static from dynamic data.
+//
 // Writes <user data>/captures/native_capture_NNN.txt per frame.
 
 #include "native_capture.h"
@@ -36,6 +41,9 @@
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/util.h>
+#include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
@@ -129,8 +137,17 @@ struct RegWrite {
   Via via;
 };
 
+// Shader microcode load (IM_LOAD from memory, IM_LOAD_IMMEDIATE inline).
+struct ShaderLoad {
+  uint32_t type;     // 0 vertex, 1 pixel
+  uint32_t address;  // physical, 0 for immediate loads
+  uint32_t dwords;
+  uint64_t hash;     // immediate loads: of the microcode
+};
+
 struct Parsed {
   std::vector<RegWrite> regs;  // in order
+  std::vector<ShaderLoad> shader_loads;
   std::vector<DrawPacket> draws;
   std::map<uint32_t, uint32_t> opcodes;  // type-3 opcode -> count
   std::vector<std::string> notes;        // unusual packets, for the event list
@@ -139,6 +156,28 @@ struct Parsed {
 
 // SET_CONSTANT / LOAD_ALU_CONSTANT kinds: ALU, fetch, bool, loop, registers.
 constexpr uint32_t kConstBase[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
+
+bool g_log_packets = false;  // log every packet as a note (inside the tiling hooks)
+
+void LogPacket(const Guest& g, uint32_t p, uint32_t size, Parsed& out) {
+  if (out.notes.size() >= 400) return;
+  std::string n = fmt::format("pkt {:08X}:", p);
+  for (uint32_t i = 0; i < size && i < 12; ++i) n += fmt::format(" {:08X}", g.U32(p + i * 4));
+  if (size > 12) n += fmt::format(" ... ({} dwords)", size);
+  out.notes.push_back(n);
+}
+
+uint64_t Fnv(const uint8_t* data, size_t bytes) {
+  uint64_t h = 0xCBF29CE484222325ull;
+  size_t i = 0;
+  for (; i + 8 <= bytes; i += 8) {
+    uint64_t w;
+    std::memcpy(&w, data + i, 8);
+    h = (h ^ w) * 0x100000001B3ull;
+  }
+  for (; i < bytes; ++i) h = (h ^ data[i]) * 0x100000001B3ull;
+  return h;
+}
 
 void ParsePm4(const Guest& g, uint32_t p, uint32_t end, Parsed& out) {
   const uint32_t start = p;
@@ -191,6 +230,13 @@ void ParsePm4(const Guest& g, uint32_t p, uint32_t end, Parsed& out) {
           for (uint32_t i = 0; i < size; ++i)
             out.regs.push_back({kConstBase[kind] + offset + i, g.U32(0xA0000000 + address + i * 4),
                                 p, Via::kLoadAluConstant});
+      } else if (op == 0x27 && count >= 2) {  // IM_LOAD
+        const uint32_t addr_type = g.U32(p + 4), start_size = g.U32(p + 8);
+        out.shader_loads.push_back({addr_type & 3, addr_type & ~3u, start_size & 0xFFFF, 0});
+      } else if (op == 0x2B && count >= 2) {  // IM_LOAD_IMMEDIATE
+        const uint32_t dwords = g.U32(p + 8) & 0xFFFF;
+        out.shader_loads.push_back(
+            {g.U32(p + 4) & 3, 0, dwords, Fnv(g.Ptr(p + 12), std::min(dwords, count - 2) * 4)});
       } else if (op == 0x22 && count >= 2) {  // DRAW_INDX
         DrawPacket d;
         d.packet = p;
@@ -207,6 +253,12 @@ void ParsePm4(const Guest& g, uint32_t p, uint32_t end, Parsed& out) {
         d.inline_indices = true;
         out.draws.push_back(d);
       }
+    }
+    if (g_log_packets) {
+      LogPacket(g, p, size, out);
+    } else if (type == 3) {  // replays and predication: always worth seeing
+      const uint32_t op = (h >> 8) & 0x7F;
+      if (op == 0x3F || op == 0x37 || (op >= 0x60 && op <= 0x65)) LogPacket(g, p, size, out);
     }
     p += size * 4;
   }
@@ -271,6 +323,19 @@ struct Frame {
     uint32_t surface_info, color_info, depth_info, rt0, ds, draws;
   };
   std::vector<Pass> passes;
+  // resources used by the frame's draws (see CollectResources)
+  struct Texture {
+    uint32_t fetch[6];
+    uint32_t draws = 0;
+    bool resolve_dest = false;
+  };
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t>, Texture> textures;  // base, dword1, dword2
+  struct Buffer {
+    uint32_t draws = 0;
+  };
+  std::map<std::tuple<char, uint32_t, uint32_t>, Buffer> buffers;  // kind I/V, address, bytes
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint64_t>, uint32_t> shaders;  // -> draws
+  std::vector<uint32_t> resolve_dest_bases;
 };
 
 Frame g_frame;
@@ -334,6 +399,95 @@ void CatchUp(const Guest& g, uint32_t now, char region = 'B') {
 // Next free ring address.
 uint32_t RingPos(const Guest& g, uint32_t device) { return g.U32(device + kRingWrite) + 4; }
 
+uint8_t* g_base = nullptr;  // guest memory, for hashing at the end of the frame
+std::unordered_map<std::string, uint64_t> g_prev_hashes;  // resource key -> hash, this capture
+
+// Hash of a resource's memory (physical address) and its status against the
+// previous frames of this capture: new / same / changed.
+char HashStatus(const Guest& g, const std::string& key, uint32_t phys, uint32_t bytes,
+                uint64_t* hash_out) {
+  if (phys >= 0x20000000 || bytes == 0) return '?';
+  const uint64_t h = Fnv(g.Ptr(0xA0000000 + phys), std::min<uint32_t>(bytes, 32u << 20));
+  *hash_out = h;
+  auto [it, inserted] = g_prev_hashes.try_emplace(key, h);
+  if (inserted) return 'n';
+  const char status = it->second == h ? 's' : 'c';
+  it->second = h;
+  return status;
+}
+
+void WriteResources(std::ofstream& out, const Guest& g) {
+  namespace xg = rex::graphics;
+  const Frame& f = g_frame;
+  std::map<char, std::map<char, uint32_t>> summary;  // kind -> status -> count
+  std::vector<std::string> lines;
+  for (auto& [key, t] : f.textures) {
+    xg::xenos::xe_gpu_texture_fetch_t fetch;
+    std::memcpy(&fetch, t.fetch, sizeof(t.fetch));
+    uint32_t w = 1, h = 1, d = 1;
+    switch (fetch.dimension) {
+      case xg::xenos::DataDimension::k1D: w = fetch.size_1d.width + 1; break;
+      case xg::xenos::DataDimension::k2DOrStacked:
+        w = fetch.size_2d.width + 1, h = fetch.size_2d.height + 1;
+        d = fetch.stacked ? fetch.size_2d.stack_depth + 1 : 1;
+        break;
+      case xg::xenos::DataDimension::k3D:
+        w = fetch.size_3d.width + 1, h = fetch.size_3d.height + 1, d = fetch.size_3d.depth + 1;
+        break;
+      case xg::xenos::DataDimension::kCube:
+        w = fetch.size_2d.width + 1, h = fetch.size_2d.height + 1, d = 6;
+        break;
+    }
+    const auto* info = xg::FormatInfo::Get(uint32_t(fetch.format));
+    const auto layout = xg::texture_util::GetGuestTextureLayout(
+        fetch.dimension, fetch.pitch, w, h, d, fetch.tiled, fetch.format, fetch.packed_mips, true,
+        fetch.mip_max_level);
+    const uint32_t base = fetch.base_address << 12, bytes = layout.base.level_data_extent_bytes;
+    const bool rt = std::find(f.resolve_dest_bases.begin(), f.resolve_dest_bases.end(),
+                              fetch.base_address) != f.resolve_dest_bases.end();
+    uint64_t hash = 0;
+    const char st = HashStatus(g, fmt::format("t{:08X}{:08X}{:08X}", base, t.fetch[1], t.fetch[2]),
+                               base, bytes, &hash);
+    ++summary[rt ? 'R' : 'T'][st];
+    lines.push_back(fmt::format(
+        "{} {:08X} {:<16} {}x{}x{} dim {} pitch {} {} mips {}-{}{} mipaddr {:08X} | {} bytes, {} "
+        "draws, {} {:016X}",
+        rt ? "rtex" : "tex ", base, info ? info->name : "?", w, h, d, uint32_t(fetch.dimension),
+        fetch.pitch * 32, fetch.tiled ? "tiled" : "linear", uint32_t(fetch.mip_min_level),
+        uint32_t(fetch.mip_max_level), fetch.packed_mips ? " packed" : "",
+        fetch.mip_address << 12, bytes, t.draws, st, hash));
+  }
+  for (auto& [key, b] : f.buffers) {
+    auto [kind, address, bytes] = key;
+    uint64_t hash = 0;
+    const char st = HashStatus(g, fmt::format("{}{:08X}{:08X}", kind, address, bytes), address,
+                               bytes, &hash);
+    ++summary[kind][st];
+    lines.push_back(fmt::format("{}  {:08X} {} bytes, {} draws, {} {:016X}",
+                                kind == 'I' ? "ib" : "vb", address, bytes, b.draws, st, hash));
+  }
+  for (auto& [key, draws] : f.shaders) {
+    auto [type, address, dwords, imm_hash] = key;
+    uint64_t hash = imm_hash;
+    char st = 'i';  // immediate: microcode was in the ring
+    if (address) st = HashStatus(g, fmt::format("s{:08X}", address), address, dwords * 4, &hash);
+    ++summary['S'][st];
+    lines.push_back(fmt::format("{} {:08X} {} dwords, {} loads, {} {:016X}",
+                                type ? "ps " : "vs ", address, dwords, draws, st, hash));
+  }
+  out << "\n## resources (status: n = first seen in this capture, s = same as the previous "
+         "frame, c = changed, i = immediate)\n";
+  static constexpr std::pair<char, const char*> kKinds[] = {
+      {'T', "textures"}, {'R', "resolve targets"}, {'V', "vertex buffers"},
+      {'I', "index buffers"}, {'S', "shader loads"}};
+  for (auto [kind, name] : kKinds) {
+    out << fmt::format("{}:", name);
+    for (auto [st, n] : summary[kind]) out << fmt::format(" {}={}", st, n);
+    out << '\n';
+  }
+  for (auto& l : lines) out << l << '\n';
+}
+
 void WriteFrame() {
   std::error_code ec;
   std::filesystem::create_directories(g_out_dir, ec);
@@ -382,6 +536,7 @@ void WriteFrame() {
   for (auto& p : f.passes)
     out << fmt::format("{:08X} {:08X} {:08X} {:08X} {:08X} {}\n", p.surface_info, p.color_info,
                        p.depth_info, p.rt0, p.ds, p.draws);
+  WriteResources(out, Guest{g_base});
   out << "\n## events\n";
   for (auto& e : f.events) out << e << '\n';
   REXLOG_INFO("[native] wrote {} ({} draws, {} flush mismatches, {} state mismatches)",
@@ -398,6 +553,43 @@ void Arm() {
 std::atomic<bool> g_signal{false};
 void OnSignal(int) { g_signal.store(true); }
 #endif
+
+// D3D objects hold CPU (virtual) addresses; the GPU sees physical ones. The
+// 0xE0000000 view of physical memory is offset by 4 KB (as SetTexture does).
+uint32_t GpuAddress(uint32_t va) { return (va & 0x1FFFFFFF) + (va >= 0xE0000000 ? 0x1000 : 0); }
+
+// Resources a draw uses: the fetch constants its flush wrote (so they're live
+// for this draw), its index buffer and its shader microcode loads.
+void CollectResources(const Guest& g, uint32_t device, const Parsed& parsed) {
+  Frame& f = g_frame;
+  uint32_t slots = 0;  // fetch constant slots written
+  for (const RegWrite& w : parsed.regs)
+    if (w.reg >= 0x4800 && w.reg < 0x4800 + 32 * 6) slots |= 1u << ((w.reg - 0x4800) / 6);
+  for (uint32_t s = 0; s < 32; ++s) {
+    if (!(slots & (1u << s))) continue;
+    const uint32_t at = device + kFetchConstants + s * 24;
+    uint32_t fc[6];
+    for (int i = 0; i < 6; ++i) fc[i] = g.U32(at + i * 4);
+    const uint32_t type = fc[0] & 3;
+    if (type == 2) {  // texture
+      auto& t = f.textures[{fc[1] >> 12, fc[1], fc[2]}];
+      std::memcpy(t.fetch, fc, sizeof(fc));
+      ++t.draws;
+    } else if (type == 3) {  // three vertex fetches
+      for (int v = 0; v < 3; ++v) {
+        if ((fc[v * 2] & 3) != 3) continue;
+        const uint32_t address = fc[v * 2] & ~3u, bytes = ((fc[v * 2 + 1] >> 2) & 0xFFFFFF) * 4;
+        if (bytes) ++f.buffers[{'V', address, bytes}].draws;
+      }
+    }
+  }
+  for (const DrawPacket& d : parsed.draws) {
+    if (d.inline_indices || !d.index_base) continue;
+    const uint32_t count = d.initiator >> 16, size = (d.initiator >> 11) & 1 ? 4 : 2;
+    ++f.buffers[{'I', d.index_base, count * size}].draws;
+  }
+  for (const ShaderLoad& l : parsed.shader_loads) ++f.shaders[{l.type, l.address, l.dwords, l.hash}];
+}
 
 // The render target state a native renderer would read.
 std::string Targets(const Guest& g, uint32_t device) {
@@ -452,6 +644,7 @@ void EndDraw(const DrawArgs& a, uint8_t* base) {
   // the flush's writes belong to this draw (g_frame.draws already counts it)
   for (const RegWrite& w : parsed.regs) g_mirror[w.reg] = {w.value, {w.packet, n, 'D', w.via}};
   for (auto& [op, cnt] : parsed.opcodes) f.opcodes[op] += cnt;
+  CollectResources(g, a.device, parsed);
 
   // GPU state as rebuilt from the stream, against the shadow.
   for (auto& [reg, mv] : g_mirror) {
@@ -491,6 +684,7 @@ void EndDraw(const DrawArgs& a, uint8_t* base) {
 
 void OnSwapLocked(uint8_t* base) {
   Guest g{base};
+  g_base = base;
   const uint32_t device = g_device.load(std::memory_order_relaxed);
   const int state = g_state.load();
   if (state == 2) {
@@ -506,6 +700,7 @@ void OnSwapLocked(uint8_t* base) {
     if (state == 1) {
       g_frames_left = std::max(1, REXCVAR_GET(native_capture_frames));
       g_mirror.clear();
+      g_prev_hashes.clear();
       g_pending = Parsed{};
       g_ring_last = 0;
     }
@@ -595,7 +790,12 @@ extern "C" REX_FUNC(sub_823C6450) {
       "R {} flags {:08X} rect {:08X} dest {:08X} point {:08X} level {} slice {} clear {:08X} z {} "
       "| {}",
       g_frame.resolves++, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32,
-      ctx.r10.u32, ctx.f1.f64, Targets(g, device)));
+      ctx.r10.u32, ctx.f1.f64, Targets(g, device)) +
+      (ctx.r6.u32 ? fmt::format(" | dest fetch {:08X} {:08X} {:08X}", g.U32(ctx.r6.u32 + 28),
+                                g.U32(ctx.r6.u32 + 32), g.U32(ctx.r6.u32 + 36))
+                  : std::string()));
+  if (const uint32_t dest = ctx.r6.u32)
+    g_frame.resolve_dest_bases.push_back(GpuAddress(g.U32(dest + 28 + 4) & ~0xFFFu) >> 12);
   __imp__sub_823C6450(ctx, base);
   CatchUp(g, RingPos(g, device), 'R');
 }
@@ -638,4 +838,63 @@ extern "C" REX_FUNC(sub_823C5C28) {
       ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.f1.f64, ctx.r9.u32, Targets(g, device)));
   __imp__sub_823C5C28(ctx, base);
   CatchUp(g, RingPos(g, device), 'C');
+}
+
+// sub_823B9308 BeginTiling(device, flags, count, tile rects, clear color, [f1]
+// z, stencil) / sub_823B9678 EndTiling(device, resolve flags, resolve rects,
+// dest texture, clear color, [f1] z, stencil, params): predicated tiling
+// (EDRAM too small for the 4x MSAA scene). Logs the tile rectangles and every
+// packet they write.
+namespace {
+
+std::string Rects(const Guest& g, uint32_t ptr, uint32_t count) {
+  std::string r;
+  for (uint32_t i = 0; ptr && i < count && i < 8; ++i)
+    r += fmt::format(" ({},{})-({},{})", int32_t(g.U32(ptr + i * 16)), int32_t(g.U32(ptr + i * 16 + 4)),
+                     int32_t(g.U32(ptr + i * 16 + 8)), int32_t(g.U32(ptr + i * 16 + 12)));
+  return r;
+}
+
+template <void (*Original)(PPCContext&, uint8_t*)>
+void TilingHook(PPCContext& ctx, uint8_t* base, char tag, std::string event) {
+  std::lock_guard lock(g_mutex);
+  Guest g{base};
+  const uint32_t device = ctx.r3.u32;
+  CatchUp(g, RingPos(g, device));
+  g_frame.events.push_back(std::move(event) + " | " + Targets(g, device));
+  g_log_packets = true;
+  Original(ctx, base);
+  Scan(g, RingPos(g, device));
+  g_log_packets = false;
+  CatchUp(g, RingPos(g, device), tag);
+}
+
+}  // namespace
+
+extern "C" REX_FUNC(__imp__sub_823B9308);
+extern "C" REX_FUNC(sub_823B9308) {
+  TB2_TRACE_HOOKED(0x823B9308);
+  if (g_state.load(std::memory_order_relaxed) != 2) {
+    [[clang::musttail]] return __imp__sub_823B9308(ctx, base);
+  }
+  Guest g{base};
+  TilingHook<__imp__sub_823B9308>(
+      ctx, base, 'T',
+      fmt::format("T begin tiling flags {:08X} count {} rects{} clear {:08X} z {} stencil {}",
+                  ctx.r4.u32, ctx.r5.u32, Rects(g, ctx.r6.u32, ctx.r5.u32), ctx.r7.u32, ctx.f1.f64,
+                  ctx.r8.u32));
+}
+
+extern "C" REX_FUNC(__imp__sub_823B9678);
+extern "C" REX_FUNC(sub_823B9678) {
+  TB2_TRACE_HOOKED(0x823B9678);
+  if (g_state.load(std::memory_order_relaxed) != 2) {
+    [[clang::musttail]] return __imp__sub_823B9678(ctx, base);
+  }
+  TilingHook<__imp__sub_823B9678>(
+      ctx, base, 'E',
+      fmt::format("E end tiling resolve flags {:08X} rects {:08X} dest {:08X} clear {:08X} z {} "
+                  "stencil {} params {:08X}",
+                  ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.f1.f64, ctx.r8.u32,
+                  ctx.r9.u32));
 }

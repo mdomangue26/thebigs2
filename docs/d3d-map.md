@@ -168,15 +168,72 @@ pitch in the low 14 bits):
    resolve after each)
 7. HUD/UI: 90 draws into the front-buffer target, final resolve -> Swap
 
-The main scene's surface registers say 1x: the game's 4x MSAA and 3-tile
-predicated tiling are applied by `BeginTiling` / `EndTiling` (three
-`INDIRECT_BUFFER` replays per frame), which a native renderer needs to handle
-explicitly.
+This frame is from the desktop default (`resolution_scale = 2`, which also
+sets `scene_msaa = false`): no MSAA, no tiling. The three `INDIRECT_BUFFER`
+packets per frame are small fixed command buffers (74, 13, 48 dwords) at the
+start and end of the frame, not replays.
+
+### MSAA and predicated tiling (`--resolution_scale=1`, `scene_msaa` on)
+
+The main scene pass is wrapped in `BeginTiling` (`823B9308`) /
+`EndTiling` (`823B9678`), called from renderlib's pass setup:
+
+- `BeginTiling(device, flags 0, count 3, rects (0,0)-(1280,240),
+  (0,240)-(1280,480), (0,480)-(1280,720), clear color, z 1, stencil)`:
+  `RB_SURFACE_INFO` becomes `0x14020500` (pitch 1280, 4x MSAA). D3D clears
+  (one rectangle draw) and writes per-tile setup (`SET_BIN_MASK`, window
+  offset/scissor via `SET_CONSTANT` to `0x2080..0x2082`).
+- Draws in between are recorded once; D3D wraps each in `SET_BIN_MASK` and
+  an `EVENT_WRITE_EXT` screen-extent event (the GPU's binning, so per-tile
+  passes skip draws outside the tile); many packets carry the predicate bit.
+  Draw count and state are the same as without tiling (~1,356).
+- Before `EndTiling` the game resolves **per tile** (tile rect pointers):
+  depth four times per tile, one MSAA sample each (flags `0x14`, `0x24`,
+  `0x34`, `0x44`), into the same texture, and color once per tile (`0x300`).
+- `EndTiling(resolve flags 0, ...)` only ends the binning (waits, a CPU
+  callback register write, bin mask reset).
+
+For a native renderer: `BeginTiling` = begin a full-size 4x MSAA pass with a
+clear; per-tile resolves = sub-rectangle resolves of that target (the same
+result); a per-sample depth resolve = copy sample *n*. The predication
+packets can be ignored.
+
+## Resources
+
+D3D textures and buffers are headers (`D3DBaseTexture`: fetch constant at
+`+28`, 6 dwords) that hold **CPU virtual** addresses; the fetch constants the
+GPU sees hold physical ones (`va & 0x1FFFFFFF`, + 4 KB for the `0xE0000000`
+view, as `SetTexture` converts). The loading trace shows no D3D resource
+creation calls: headers are filled by the engine/XGraphics, so a native
+renderer creates host resources lazily from the fetch constant at first use
+(as the SDK's texture cache does), keyed by address + format + size.
+
+The capture's resource table (fetch constants written by each draw's flush,
+index buffers from the draw packets, shader microcode from `IM_LOAD` /
+`IM_LOAD_IMMEDIATE`; contents hashed and compared between consecutive frames;
+sizes from the SDK's `texture_util::GetGuestTextureLayout`), 2026-10-17,
+24 frames in pairs over menus, video, stadium intro, batting, fielding and
+replays:
+
+| | per frame (batting) | between consecutive frames |
+|---|---:|---|
+| textures | ~380–405 | all unchanged; the intro video's 3 Bink textures alternate addresses |
+| resolve targets sampled | 10–12 | written by the GPU each frame (1536² D24S8 shadow map, 512² env map, luminance chain 256/64/8/1 in `k_16_16`, bloom 320x180/160x90, 1280x720 scene copies) |
+| index buffers | ~470–500 | unchanged (2 new in one frame) |
+| vertex buffers | ~460–550 | unchanged except: `03FAA1D0` (384 KB) and `05941B30` (3 MB) rewritten in place every frame, and 1–32 small buffers (80 B–100 KB) at new addresses each frame (a per-frame allocator) |
+| shader microcode | ~82 from memory + ~15 inline | unchanged |
+
+So: cache textures, index buffers, shaders and most vertex buffers by address
+and content (invalidate on CPU writes, like the SDK's write watches), upload
+the dynamic vertex data per frame, and keep resolve targets on the GPU. At
+`resolution_scale = 2` the SDK keeps resolve results in host textures only, so
+their guest memory never changes (the hashes above are of stale memory).
 
 ## Open questions
 
 - Confirm the remaining `?` names (render states, samplers, streams).
-- How `BeginTiling`/`EndTiling` set up MSAA and the tiles.
+- Which code fills the dynamic vertex buffers (`memoryvertexbuffer.cpp`?),
+  so a native renderer can upload them without hashing.
 - Resource creation (textures, vertex/index buffers, shaders) happens at load
   time; map it from a loading-screen trace (`trace_at_start`, or F8 during a
   load with a larger `trace_frames`).

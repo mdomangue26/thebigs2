@@ -1,7 +1,7 @@
 # Native Vulkan renderer — plan and findings
 
-Status: **Phase 0 (mapping) done; phase 1 (shadow capture) validated, resource
-mapping still open.** Work happens on the
+Status: **Phases 0 (mapping) and 1 (shadow capture) done; phase 2 (resources)
+next.** Work happens on the
 `native-renderer` branch. The game still renders through the SDK's Xenos GPU
 emulator; nothing here changes that yet. Findings: [d3d-map.md](d3d-map.md).
 
@@ -101,8 +101,10 @@ renderer via `OnCreateImmediateDrawer`).
    behaviour and records each frame as a native renderer would read it, checked
    against the PM4 stream D3D sends to the GPU: the device shadow holds the
    complete GPU state at every draw ([d3d-map.md](d3d-map.md#phase-1-shadow-capture-srcnative_capturecpp)).
-   Still open: resource creation (textures, buffers, shaders) from a loading
-   trace, and `BeginTiling`/`EndTiling`.
+   Also mapped: MSAA / predicated tiling (`BeginTiling`/`EndTiling` = one
+   full-size 4x MSAA pass for a native renderer) and resources (created lazily
+   from fetch constants; nearly everything static after loading, a few MB of
+   dynamic vertex data per frame) - see [d3d-map.md](d3d-map.md#resources).
 2. **Resources**. Textures (format conversion, untiling, mips), vertex/index
    buffers, vertex declarations, shaders translated to SPIR-V, pipeline cache.
 3. **First native pixels**. Draw one simple pass natively — the 2D front end

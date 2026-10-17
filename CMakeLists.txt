@@ -71,9 +71,11 @@ if(TB2_RENDER_TRACE)
     add_custom_command(
         OUTPUT "${_trace_cpp}"
         COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_render_trace.py"
-                "${CMAKE_CURRENT_SOURCE_DIR}/generated/default" "${_trace_cpp}"
-                d3d:823A6400-823DE000 renderlib:82460000-8249B800
+                "${CMAKE_CURRENT_SOURCE_DIR}/generated/default" "${CMAKE_CURRENT_SOURCE_DIR}/src"
+                "${_trace_cpp}" d3d:823A6400-823DE000 renderlib:82460000-8249B800
+                d3d:824D92E8-824DC3E8
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_render_trace.py" "${_codegen_stamp}"
+                ${THEBIGS2_SOURCES}
         COMMENT "Generating render trace wrappers"
         VERBATIM)
     target_sources(thebigs2 PRIVATE src/render_trace.cpp "${_trace_cpp}")

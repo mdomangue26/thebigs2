@@ -2,19 +2,25 @@
 """Generate call-counting wrappers for every recompiled function in the given
 guest address ranges (render tracing, see docs/native-renderer.md).
 
-  gen_render_trace.py <generated_dir> <out.cpp> name:lo-hi [name:lo-hi ...]
+  gen_render_trace.py <generated_dir> <src_dir> <out.cpp> name:lo-hi [name:lo-hi ...]
 
 Each wrapper overrides the weak `sub_XXXXXXXX` symbol, records the call, and
 tail-calls the original `__imp__sub_XXXXXXXX`, so behaviour is unchanged.
+Functions the game already hooks in <src_dir> (`extern "C" REX_FUNC(sub_X) {`)
+are listed but not wrapped; their hooks call TB2_TRACE_HOOKED themselves.
 """
 import glob, re, sys
 
-gen_dir, out_path, *specs = sys.argv[1:]
-ranges = []
+gen_dir, src_dir, out_path, *specs = sys.argv[1:]
+# A name may be given for several spans (the XDK D3D library is linked in two
+# places); they share one range index.
+names, ranges = [], []
 for spec in specs:
     name, _, span = spec.partition(':')
     lo, _, hi = span.partition('-')
-    ranges.append((name, int(lo, 16), int(hi, 16)))
+    if name not in names:
+        names.append(name)
+    ranges.append((names.index(name), int(lo, 16), int(hi, 16)))
 
 func_re = re.compile(r'^DEFINE_REX_FUNC\(sub_([0-9A-F]{8})\)', re.M)
 funcs = {}
@@ -22,10 +28,16 @@ for path in glob.glob(f'{gen_dir}/*_recomp.*.cpp'):
     with open(path, errors='replace') as f:
         for m in func_re.finditer(f.read()):
             addr = int(m.group(1), 16)
-            for ri, (_, lo, hi) in enumerate(ranges):
+            for ri, lo, hi in ranges:
                 if lo <= addr < hi:
                     funcs[addr] = ri
                     break
+
+hook_re = re.compile(r'REX_FUNC\(sub_([0-9A-F]{8})\)\s*\{')
+hooked = set()
+for path in glob.glob(f'{src_dir}/*.cpp') + glob.glob(f'{src_dir}/*.h'):
+    with open(path, errors='replace') as f:
+        hooked |= {int(a, 16) for a in hook_re.findall(f.read())}
 
 addrs = sorted(funcs)
 lines = [
@@ -40,9 +52,11 @@ lines = [
 ]
 lines += [f'  {{0x{a:08X}u, {funcs[a]}}},' for a in addrs] or ['  {0, 0},']
 lines += ['};', 'const char* const tb2_trace_range_names[] = {']
-lines += [f'  "{n}",' for n, _, _ in ranges]
+lines += [f'  "{n}",' for n in names]
 lines += ['};', '']
 for i, a in enumerate(addrs):
+    if a in hooked:
+        continue
     lines += [
         f'extern "C" REX_FUNC(__imp__sub_{a:08X});',
         f'extern "C" REX_FUNC(sub_{a:08X}) {{',
@@ -52,4 +66,6 @@ for i, a in enumerate(addrs):
     ]
 with open(out_path, 'w') as f:
     f.write('\n'.join(lines) + '\n')
-print(f'render trace: wrapped {len(addrs)} functions', file=sys.stderr)
+n_hooked = len(hooked & set(addrs))
+print(f'render trace: wrapped {len(addrs) - n_hooked} functions, {n_hooked} hooked in src/',
+      file=sys.stderr)

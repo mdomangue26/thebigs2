@@ -1,0 +1,75 @@
+# Names for XDK D3D / renderlib functions, used by tools/trace_summary.py.
+# <address> <name>   ("?" = tentative; evidence in docs/d3d-map.md)
+
+# Draws, flush, resolve, present (D3D)
+824DA698 DrawVertices
+824DAA88 DrawIndexedVertices
+823C6450 Resolve
+823B9308 BeginTiling
+823B9678 EndTiling
+823B9CB8 QueueFlip
+823BA340 Swap(inner)
+823BA338 Swap?
+823B9E68 Swap(body)?
+823B2A50 RingKickOff?
+823B0E00 RingReserve?
+823B2160 WaitForGpuSpace
+823B3310 PollGpuFence
+
+# Pending-state flush helpers (called by the Draw* functions only)
+823B78E0 FlushAluConstants
+823B7548 FlushRegisterBlock
+823B7788 FlushFetchConstants?
+823B8708 FlushStateGroup?
+823B71B0 FlushRegisters2?
+823B7608 FlushRegisters3?
+
+# Shader constants and textures/streams (device shadow + dirty masks)
+823BC810 SetVertexShaderConstantF
+823BC8E8 SetPixelShaderConstantF
+823AF7B0 SetTexture
+823B6068 SetStreamSource?
+823B6188 SetIndices?
+823BCB58 SetVertexShader?
+823BCD18 SetPixelShader?
+823B5548 SetSamplerState_A?
+823B56F0 SetSamplerState_B?
+823B5990 SetSamplerState_C?
+823B5AB0 SetSamplerState_D?
+
+# Render states (register images at device+10368.., dirty mask device+16)
+823B44F0 SetRenderState_Depth_A?
+823B4410 SetRenderState_Depth_B?
+823B4440 SetRenderState_Depth_C?
+823B4478 SetRenderState_DepthStencil?
+823B4690 SetRenderState_StencilRef?
+823B3D40 SetRenderState_Blend_A?
+823B3DD0 SetRenderState_Blend_B?
+823B3E60 SetRenderState_Blend_C?
+823B3EF0 SetRenderState_Blend_D?
+823B3D08 SetRenderState_AlphaTest_A?
+823B41C8 SetRenderState_AlphaTest_B?
+823B4168 SetRenderState_AlphaRef?
+823B4878 SetRenderState_DepthBias_On?
+823B47B0 SetRenderState_DepthBias_Off?
+
+# Render targets (renderlib pass setup sub_82495A90 / sub_82496020)
+823B68D0 SetRenderTarget?
+823B6EF8 SetDepthStencilSurface?
+823B6C20 SetViewport?
+823B67A0 UpdateSurfaceRegisters?
+
+# renderlib (engine)
+8249AF80 rl_ExecuteCommandList
+82493950 rl_DrawQuad?
+82492C00 rl_SetVsConstants168?
+82490E08 rl_SetSamplerStates
+82491598 rl_SetMaterialRenderStates
+82495A90 rl_BeginPass?
+82496020 rl_ResolvePass?
+82493660 rl_BindTextures
+82492B08 rl_UploadPixelConstants
+82492A10 rl_UploadVertexConstants
+82491CB8 rl_SetPassMultisample
+82491BF8 rl_SetPassTiling
+82219148 SetupScenePasses

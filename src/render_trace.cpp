@@ -162,6 +162,12 @@ void TB2TraceHit(uint32_t index, uint64_t lr) {
     g_events.push_back({index, uint32_t(lr), it->second, g_frame});
 }
 
+void TB2TraceHitAddress(uint32_t address, uint64_t lr) {
+  if (g_state.load(std::memory_order_relaxed) == State::kIdle) return;
+  const uint32_t index = FindIndex(address);
+  if (index != UINT32_MAX) TB2TraceHit(index, lr);
+}
+
 void TB2TraceInit(const std::filesystem::path& out_dir) {
   g_out_dir = out_dir;
   g_marker_index = FindIndex(uint32_t(std::stoul(REXCVAR_GET(trace_frame_marker), nullptr, 16)));

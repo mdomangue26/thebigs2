@@ -19,6 +19,8 @@
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
 
+#include "render_trace.h"
+
 REXCVAR_DEFINE_BOOL(scene_msaa, true, "The Bigs 2",
                     "Main scene 4x MSAA as on the Xbox 360. false = no MSAA, which also "
                     "removes the 3-tile rendering the console needed for it (much less CPU "
@@ -26,6 +28,7 @@ REXCVAR_DEFINE_BOOL(scene_msaa, true, "The Bigs 2",
 
 extern "C" REX_FUNC(__imp__sub_82491BF8);
 extern "C" REX_FUNC(sub_82491BF8) {
+  TB2_TRACE_HOOKED(0x82491BF8);
   if (!REXCVAR_GET(scene_msaa) && ctx.r5.u32 > 1) {
     REXLOG_INFO("[render] entry {}: predicated tiling ({} tiles) off", ctx.r4.u32, ctx.r5.u32);
     ctx.r5.u64 = 0;
@@ -35,6 +38,7 @@ extern "C" REX_FUNC(sub_82491BF8) {
 
 extern "C" REX_FUNC(__imp__sub_82491CB8);
 extern "C" REX_FUNC(sub_82491CB8) {
+  TB2_TRACE_HOOKED(0x82491CB8);
   if (!REXCVAR_GET(scene_msaa) && ctx.r5.u32 != 0) {
     REXLOG_INFO("[render] entry {}: multisample type {} -> none", ctx.r4.u32, ctx.r5.u32);
     ctx.r5.u64 = 0;

@@ -27,6 +27,8 @@
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
 
+#include "render_trace.h"
+
 REXCVAR_DEFINE_DOUBLE(fps_log_interval, 0.0, "The Bigs 2/Debug",
                       "Log the game's frame rate every N seconds; 0 = off");
 
@@ -170,9 +172,9 @@ rex::ui::FrameStats GuestFrameStats() {
 
 }  // namespace tb2
 
-#if !defined(TB2_RENDER_TRACE)  // the trace build wraps every D3D function itself
 extern "C" REX_FUNC(__imp__sub_823BA340);
 extern "C" REX_FUNC(sub_823BA340) {
+  TB2_TRACE_HOOKED(0x823BA340);
   OnSwap();
   __imp__sub_823BA340(ctx, base);
   OnSwapReturn();
@@ -189,13 +191,13 @@ REXCVAR_DEFINE_INT32(gpu_wait_sleep_us, 100, "The Bigs 2/Debug",
                      "Sleep between polls while the game waits for the GPU (us); 0 = spin");
 extern "C" REX_FUNC(__imp__sub_823B3310);
 extern "C" REX_FUNC(sub_823B3310) {
+  TB2_TRACE_HOOKED(0x823B3310);
   __imp__sub_823B3310(ctx, base);
   const int32_t sleep_us = REXCVAR_GET(gpu_wait_sleep_us);
   if (ctx.r3.u32 != 0 && sleep_us > 0) {
     std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
   }
 }
-#endif
 
 // ---------------------------------------------------------------------------
 // sub_823B9CB8: the XDK D3D library queues a flip for the vblank handler.
@@ -211,9 +213,9 @@ REXCVAR_DEFINE_INT32(frame_rate, 30, "The Bigs 2",
 // Older name, still honoured (true = frame_rate 60).
 REXCVAR_DEFINE_BOOL(fps_60, false, "The Bigs 2", "Old name for frame_rate = 60");
 
-#if !defined(TB2_RENDER_TRACE)  // the trace build wraps every D3D function itself
 extern "C" REX_FUNC(__imp__sub_823B9CB8);
 extern "C" REX_FUNC(sub_823B9CB8) {
+  TB2_TRACE_HOOKED(0x823B9CB8);
   const uint32_t arg = ctx.r3.u32;
   const uint32_t interval = (arg >> 8) & 0xF;
   static std::atomic<uint32_t> last_interval{~0u};
@@ -225,4 +227,3 @@ extern "C" REX_FUNC(sub_823B9CB8) {
   }
   [[clang::musttail]] return __imp__sub_823B9CB8(ctx, base);
 }
-#endif

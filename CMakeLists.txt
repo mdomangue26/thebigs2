@@ -31,6 +31,9 @@ set(THEBIGS2_SOURCES
     src/first_launch.cpp
     src/render_tweaks.cpp
     src/native_capture.cpp
+    src/native/buffers.cpp
+    src/native/shaders.cpp
+    src/native/textures.cpp
 )
 
 if(WIN32)
@@ -51,6 +54,17 @@ elseif(DEFINED REXSDK_DIR AND EXISTS "${REXSDK_DIR}/thirdparty/sdl3/include")
 else()
     message(FATAL_ERROR "SDL3 headers not found (they ship with the ReXGlue SDK)")
 endif()
+
+# Native renderer (docs/native-renderer.md): the SDK's Xenos -> SPIR-V shader
+# translator, copied from the SDK sources (the GPU plugin doesn't export it).
+file(GLOB TB2_XENOS_SOURCES CONFIGURE_DEPENDS src/native/xenos/*.cpp)
+add_library(tb2_xenos STATIC ${TB2_XENOS_SOURCES})
+target_include_directories(tb2_xenos SYSTEM PUBLIC src/native/xenos/glslang)
+target_link_libraries(tb2_xenos PUBLIC rex::runtime rex::renderdoc rex::xxhash rex::SPIRV)
+if(NOT MSVC AND NOT CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    target_compile_options(tb2_xenos PRIVATE -Wno-unused-variable -Wno-unused-function)
+endif()
+target_link_libraries(thebigs2 PRIVATE tb2_xenos)
 
 # A user's disc image is accepted only if its default.xex is the one this
 # build was recompiled from.
@@ -89,7 +103,7 @@ rexglue_setup_target(thebigs2 GPU_PLUGINS xenos)
 # Keep the executable loadable on glibc older than the build machine's, e.g.
 # SteamOS (see src/glibc_compat.h), including the recompiled sources.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    foreach(_t thebigs2 thebigs2_recomp)
+    foreach(_t thebigs2 thebigs2_recomp tb2_xenos)
         if(TARGET ${_t})
             target_compile_options(${_t} PRIVATE
                 "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/glibc_compat.h")

@@ -1,7 +1,8 @@
 # Native Vulkan renderer — plan and findings
 
-Status: **Phases 0 (mapping) and 1 (shadow capture) done; phase 2 (resources)
-next.** Work happens on the
+Status: **Phases 0 (mapping) and 1 (shadow capture) done; phase 2 (resource
+conversion) done except the pipeline cache, which needs the Vulkan device of
+phase 3.** Work happens on the
 `native-renderer` branch. The game still renders through the SDK's Xenos GPU
 emulator; nothing here changes that yet. Findings: [d3d-map.md](d3d-map.md).
 
@@ -105,8 +106,10 @@ renderer via `OnCreateImmediateDrawer`).
    full-size 4x MSAA pass for a native renderer) and resources (created lazily
    from fetch constants; nearly everything static after loading, a few MB of
    dynamic vertex data per frame) - see [d3d-map.md](d3d-map.md#resources).
-2. **Resources**. Textures (format conversion, untiling, mips), vertex/index
-   buffers, vertex declarations, shaders translated to SPIR-V, pipeline cache.
+2. **Resources** *(conversion done 2026-10-17, see below)*. Textures (format
+   conversion, untiling, mips), vertex/index buffers, shaders translated to
+   SPIR-V (`src/native/`), checked against every draw of captured frames. The
+   pipeline cache moves to phase 3 (it needs a Vulkan device).
 3. **First native pixels**. Draw one simple pass natively — the 2D front end
    (menus, fonts) is the easiest — in a debug view beside the emulator.
 4. **Full frame**. Render targets and resolves without EDRAM, depth, MSAA,
@@ -118,6 +121,58 @@ renderer via `OnCreateImmediateDrawer`).
 
 This is a long project — comparable in size to the renderers written for other
 recompilation ports — and each phase is useful on its own.
+
+## Phase 2: resource conversion (`src/native/`)
+
+Code the native renderer will use, tested on captured frames (F6, see phase
+1) while the emulator still renders. Nothing here needs a GPU yet.
+
+- **Shaders** (`shaders.h`): microcode -> SPIR-V with the SDK's translator,
+  copied into `src/native/xenos/` (the GPU plugin doesn't export it; see the
+  README there). Vertex shader microcode comes from the load packet D3D's
+  flush writes at the draw (D3D patches vertex shaders per vertex
+  declaration); pixel shader microcode is also reachable from the
+  `D3DPixelShader` object ([d3d-map.md](d3d-map.md#shaders)). Modifications
+  per vertex + pixel shader pair, as the SDK's Vulkan backend picks them.
+  The translated shaders need `scalarBlockLayout` (Vulkan 1.2; NVIDIA and
+  RADV have it): the SDK's system-constant uniform block isn't std140-aligned,
+  which `spirv-val` rejects otherwise (drivers accept it in the emulator).
+- **Textures** (`textures.h`): fetch constant -> untiled, byte-swapped data in
+  a Vulkan format with all mips/layers laid out for `vkCmdCopyBufferToImage`
+  (DXT1/2_3/4_5/DXN/DXT5A as BC1/2/3/5/4, CTX1 converted to R8G8, 8/16/32-bit
+  and float formats as is). Sizes, mip offsets and packed mip tails come from
+  the SDK's `texture_util`. Data stays unsigned; signedness, gamma and swizzle
+  are applied when sampling (as in the SDK).
+- **Geometry** (`buffers.h`): index buffers byte-swapped, quad lists turned
+  into triangle lists (auto-indexed quads get generated indices). Vertex
+  buffers upload raw: the translated shaders fetch and byte-swap vertices
+  themselves, from a storage buffer addressed through the fetch constants (the
+  native renderer rewrites the addresses in the fetch constants it passes).
+
+The capture checks all three on every draw of the frame and writes the
+results (and, with `--native_capture_textures=<edge>`, PNG previews of every
+converted texture) next to the capture:
+
+```bash
+tools/native_capture_run.sh out/perf/ncapN 25 7 --native_capture_textures=256
+tools/native_validate.sh out/perf/ncapN/data/captures      # spirv-val every shader
+tools/native_contact_sheet.py out/perf/ncapN/data/captures/native_capture_006_textures sheet.png
+```
+
+Results (2026-10-17, menus, intro video, batting and fielding frames):
+
+| | batting frame (1,272 draws) | all frames (`out/perf/ncap21`-`27`) |
+|---|---|---|
+| textures | 388 converted, 0 failed | 0 failures; contact sheets look right (logos, faces, jersey numbers, normal maps, video planes) |
+| shaders | 69 vertex + pixel pairs, 97 translations, 0 failed | 112 unique SPIR-V modules, all pass `spirv-val` (Vulkan 1.2 + scalar block layout) |
+| shader source | 0 draws with unknown microcode; 217 pixel shader loads match the `D3DPixelShader` layout | same |
+| geometry | 1,272 draws converted (33 with generated quad indices), 0 failed | 0 failures |
+| vertex fetches | 1,163 checked against the fetch constant's buffer size: 0 out of range; 399 use a computed index (instancing, not checkable) | 0 out of range |
+
+Not done yet: the pipeline cache (needs the device, phase 3); signed / gamma
+textures and the swizzles (sampling side); the vertex shader per vertex
+declaration taken from the shadow alone (only needed if the D3D flush ever
+stops running).
 
 ## Phase 0: render tracing
 

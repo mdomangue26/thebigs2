@@ -20,16 +20,27 @@
 // microcode the draws use, hashed and compared with the previous captured
 // frame (native_capture_frames >= 2) to tell static from dynamic data.
 //
-// Writes <user data>/captures/native_capture_NNN.txt per frame.
+// Phase 2 (resources): converts every texture the frame uses to its host
+// format (src/native/textures.h; PNG previews with native_capture_textures),
+// and tracks the vertex + pixel shader microcode of every draw and translates
+// each pair to SPIR-V with the native renderer's shader library
+// (src/native/shaders.h); tools/native_validate.sh checks the SPIR-V.
+//
+// Writes <user data>/captures/native_capture_NNN.txt per frame, and the
+// translated shaders to native_capture_NNN_shaders/.
 
 #include "native_capture.h"
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
+#include <set>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -49,10 +60,18 @@
 #include <rex/ppc/func.h>
 #include <rex/ui/keybinds.h>
 
+#include "native/buffers.h"
+#include "native/shaders.h"
+#include "native/textures.h"
 #include "render_trace.h"
 
 REXCVAR_DEFINE_INT32(native_capture_frames, 1, "The Bigs 2/Debug",
                      "Frames recorded per native-renderer shadow capture (F6)");
+REXCVAR_DEFINE_BOOL(native_capture_shaders, true, "The Bigs 2/Debug",
+                    "Translate a native capture's shaders to SPIR-V and write them next to it");
+REXCVAR_DEFINE_INT32(native_capture_textures, 0, "The Bigs 2/Debug",
+                     "Write PNG previews of a native capture's converted textures, at most this "
+                     "many pixels wide/high (0 = none)");
 
 namespace {
 
@@ -113,6 +132,8 @@ uint32_t ShadowOffset(uint32_t reg) {
 }
 
 // Registers the capture prints per draw.
+constexpr uint32_t SQ_PROGRAM_CNTL = 0x2180, SQ_CONTEXT_MISC = 0x2181,
+                   SQ_INTERPOLATOR_CNTL = 0x2182;
 constexpr uint32_t RB_SURFACE_INFO = 0x2000, RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002,
                    RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201,
                    RB_COLORCONTROL = 0x2202, PA_SU_SC_MODE_CNTL = 0x2205,
@@ -143,6 +164,7 @@ struct ShaderLoad {
   uint32_t address;  // physical, 0 for immediate loads
   uint32_t dwords;
   uint64_t hash;     // immediate loads: of the microcode
+  uint32_t data;     // guest address of the microcode (in the ring for immediate loads)
 };
 
 struct Parsed {
@@ -232,11 +254,13 @@ void ParsePm4(const Guest& g, uint32_t p, uint32_t end, Parsed& out) {
                                 p, Via::kLoadAluConstant});
       } else if (op == 0x27 && count >= 2) {  // IM_LOAD
         const uint32_t addr_type = g.U32(p + 4), start_size = g.U32(p + 8);
-        out.shader_loads.push_back({addr_type & 3, addr_type & ~3u, start_size & 0xFFFF, 0});
+        out.shader_loads.push_back({addr_type & 3, addr_type & ~3u, start_size & 0xFFFF, 0,
+                                    0xA0000000 + (addr_type & ~3u)});
       } else if (op == 0x2B && count >= 2) {  // IM_LOAD_IMMEDIATE
         const uint32_t dwords = g.U32(p + 8) & 0xFFFF;
-        out.shader_loads.push_back(
-            {g.U32(p + 4) & 3, 0, dwords, Fnv(g.Ptr(p + 12), std::min(dwords, count - 2) * 4)});
+        if (dwords <= count - 2)
+          out.shader_loads.push_back(
+              {g.U32(p + 4) & 3, 0, dwords, Fnv(g.Ptr(p + 12), dwords * 4), p + 12});
       } else if (op == 0x22 && count >= 2) {  // DRAW_INDX
         DrawPacket d;
         d.packet = p;
@@ -336,6 +360,21 @@ struct Frame {
   std::map<std::tuple<char, uint32_t, uint32_t>, Buffer> buffers;  // kind I/V, address, bytes
   std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint64_t>, uint32_t> shaders;  // -> draws
   std::vector<uint32_t> resolve_dest_bases;
+  // Shader pairs drawn with: vs, ps microcode hash, SQ_PROGRAM_CNTL,
+  // SQ_CONTEXT_MISC, SQ_INTERPOLATOR_CNTL, RB_SURFACE_INFO, primitive -> draws.
+  std::map<std::tuple<uint64_t, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>,
+           uint32_t>
+      shader_pairs;
+  uint32_t shader_unknown_draws = 0;  // microcode loaded before the capture, object not seen yet
+  uint32_t shader_by_object = 0;      // draws whose shader came from the object map
+  uint32_t shader_object_stale = 0;   // object map disagrees with the tracked microcode
+  uint32_t ps_object_checked = 0, ps_object_mismatches = 0;
+  // Geometry (phase 2, src/native/buffers.h): index conversion, and the highest
+  // vertex each draw fetches against its vertex buffers' sizes.
+  uint32_t geometry_converted = 0, geometry_failed = 0, geometry_generated_indices = 0;
+  uint32_t vertex_fetches_checked = 0, vertex_fetches_out_of_range = 0;
+  uint32_t vertex_fetches_computed = 0;  // computed fetch index: not checked
+  std::vector<std::string> geometry_notes;
 };
 
 Frame g_frame;
@@ -343,7 +382,46 @@ uint32_t g_ring_last = 0;                            // end of the last parsed r
 std::unordered_map<uint32_t, MirrorValue> g_mirror;  // GPU state rebuilt from packets
 uint32_t g_frame_index = 0;
 
-void Absorb(const Parsed& parsed, char region) {
+// --- Shaders ---------------------------------------------------------------
+//
+// D3D loads microcode only when the shader changes, so the current shaders are
+// tracked across draws (and Clear/Resolve, which load their own). Draws early
+// in a capture may use shaders loaded before it; those are found through the
+// D3D objects they were loaded for (pixel shader object, vertex shader object +
+// vertex declaration - D3D patches vertex shaders per declaration).
+
+std::unordered_map<uint64_t, std::vector<uint32_t>> g_ucode;  // hash -> big-endian dwords
+uint64_t g_current_shader[2] = {};                             // vertex, pixel (0 = unknown)
+std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_vs_by_object;  // (vs object, decl) -> hash
+std::unordered_map<uint32_t, uint64_t> g_ps_by_object;
+
+tb2::native::ShaderLibrary& Library() {
+  static tb2::native::ShaderLibrary library;
+  return library;
+}
+
+// Records the microcode of the loads; returns the hash per load.
+std::vector<uint64_t> TrackShaderLoads(const Guest& g, const Parsed& parsed) {
+  std::vector<uint64_t> hashes;
+  for (const ShaderLoad& l : parsed.shader_loads) {
+    if (l.type > 1 || !l.dwords || (l.address && l.address >= 0x20000000)) {
+      hashes.push_back(0);
+      continue;
+    }
+    const uint64_t h = Fnv(g.Ptr(l.data), l.dwords * 4) | 1;  // never 0
+    auto& code = g_ucode[h];
+    if (code.empty()) {
+      code.resize(l.dwords);
+      std::memcpy(code.data(), g.Ptr(l.data), l.dwords * 4);
+    }
+    g_current_shader[l.type] = h;
+    hashes.push_back(h);
+  }
+  return hashes;
+}
+
+void Absorb(const Guest& g, const Parsed& parsed, char region) {
+  TrackShaderLoads(g, parsed);
   for (const RegWrite& w : parsed.regs)
     g_mirror[w.reg] = {w.value, {w.packet, g_frame.draws, region, w.via}};
   for (auto& [op, n] : parsed.opcodes) g_frame.opcodes[op] += n;
@@ -384,7 +462,7 @@ void CatchUp(const Guest& g, uint32_t now, char region = 'B') {
   Parsed parsed = TakePending();
   if (region == 'C' || region == 'R') {
     g_frame.clear_resolve_packets += uint32_t(parsed.draws.size());
-    Absorb(parsed, region);
+    Absorb(g, parsed, region);
     return;
   }
   g_frame.outside_draw_packets += uint32_t(parsed.draws.size());
@@ -393,7 +471,7 @@ void CatchUp(const Guest& g, uint32_t now, char region = 'B') {
                                          region, d.packet, d.initiator & 0x3F, d.initiator >> 16,
                                          (d.initiator >> 6) & 3));
   for (auto& n : parsed.notes) g_frame.events.push_back(fmt::format("N {} {}", region, n));
-  Absorb(parsed, region);
+  Absorb(g, parsed, region);
 }
 
 // Next free ring address.
@@ -416,11 +494,67 @@ char HashStatus(const Guest& g, const std::string& key, uint32_t phys, uint32_t 
   return status;
 }
 
-void WriteResources(std::ofstream& out, const Guest& g) {
+// Minimal PNG writer (stored deflate blocks) for the texture previews;
+// tools/native_contact_sheet.py recompresses them into one sheet.
+void WritePng(const std::filesystem::path& path, uint32_t w, uint32_t h,
+              const std::vector<uint8_t>& rgba) {
+  std::vector<uint8_t> raw;
+  raw.reserve(size_t(w * 4 + 1) * h);
+  for (uint32_t y = 0; y < h; ++y) {
+    raw.push_back(0);
+    raw.insert(raw.end(), rgba.begin() + size_t(y) * w * 4, rgba.begin() + size_t(y + 1) * w * 4);
+  }
+  std::vector<uint8_t> z = {0x78, 0x01};
+  uint32_t a = 1, b = 0;
+  for (uint8_t c : raw) a = (a + c) % 65521, b = (b + a) % 65521;
+  for (size_t i = 0; i < raw.size() || i == 0; i += 65535) {
+    const size_t n = std::min<size_t>(65535, raw.size() - i);
+    z.push_back(i + n >= raw.size() ? 1 : 0);
+    z.insert(z.end(), {uint8_t(n), uint8_t(n >> 8), uint8_t(~n), uint8_t(~n >> 8)});
+    z.insert(z.end(), raw.begin() + i, raw.begin() + i + n);
+    if (raw.empty()) break;
+  }
+  const uint32_t adler = b << 16 | a;
+  z.insert(z.end(), {uint8_t(adler >> 24), uint8_t(adler >> 16), uint8_t(adler >> 8), uint8_t(adler)});
+  std::ofstream f(path, std::ios::binary);
+  auto be32 = [&](std::vector<uint8_t>& v, uint32_t x) {
+    v.insert(v.end(), {uint8_t(x >> 24), uint8_t(x >> 16), uint8_t(x >> 8), uint8_t(x)});
+  };
+  auto chunk = [&](const char* type, const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> c;
+    be32(c, uint32_t(data.size()));
+    c.insert(c.end(), type, type + 4);
+    c.insert(c.end(), data.begin(), data.end());
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 4; i < c.size(); ++i) {
+      crc ^= c[i];
+      for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1)));
+    }
+    be32(c, ~crc);
+    f.write(reinterpret_cast<const char*>(c.data()), std::streamsize(c.size()));
+  };
+  f.write("\x89PNG\r\n\x1a\n", 8);
+  std::vector<uint8_t> ihdr;
+  be32(ihdr, w);
+  be32(ihdr, h);
+  ihdr.insert(ihdr.end(), {8, 6, 0, 0, 0});
+  chunk("IHDR", ihdr);
+  chunk("IDAT", z);
+  chunk("IEND", {});
+}
+
+void WriteResources(std::ofstream& out, const Guest& g, const std::filesystem::path& preview_dir) {
   namespace xg = rex::graphics;
   const Frame& f = g_frame;
   std::map<char, std::map<char, uint32_t>> summary;  // kind -> status -> count
   std::vector<std::string> lines;
+  uint32_t converted_count[2] = {};
+  std::vector<std::string> conversion_errors;
+  const int preview_edge = REXCVAR_GET(native_capture_textures);
+  if (preview_edge > 0) {
+    std::error_code ec;
+    std::filesystem::create_directories(preview_dir, ec);
+  }
   for (auto& [key, t] : f.textures) {
     xg::xenos::xe_gpu_texture_fetch_t fetch;
     std::memcpy(&fetch, t.fetch, sizeof(t.fetch));
@@ -449,6 +583,24 @@ void WriteResources(std::ofstream& out, const Guest& g) {
     const char st = HashStatus(g, fmt::format("t{:08X}{:08X}{:08X}", base, t.fetch[1], t.fetch[2]),
                                base, bytes, &hash);
     ++summary[rt ? 'R' : 'T'][st];
+    // Phase 2: convert to the host format (and preview).
+    tb2::native::HostTexture host;
+    std::string error;
+    const bool converted = tb2::native::ConvertTexture(g.base, fetch, host, &error);
+    ++converted_count[converted];
+    if (!converted && conversion_errors.size() < 20)
+      conversion_errors.push_back(fmt::format("{:08X} {}: {}", base, info ? info->name : "?", error));
+    if (converted && preview_edge > 0) {
+      uint32_t level = 0;
+      while (level + 1 < host.levels.size() &&
+             std::max(host.levels[level].width, host.levels[level].height) > uint32_t(preview_edge))
+        ++level;
+      std::vector<uint8_t> rgba;
+      if (tb2::native::DecodeToRgba8(host, level, 0, rgba))
+        WritePng(preview_dir / fmt::format("{}_{:08X}_{}_{}x{}.png", rt ? "rt" : "tex", base,
+                                           info ? info->name : "?", w, h),
+                 host.levels[level].width, host.levels[level].height, rgba);
+    }
     lines.push_back(fmt::format(
         "{} {:08X} {:<16} {}x{}x{} dim {} pitch {} {} mips {}-{}{} mipaddr {:08X} | {} bytes, {} "
         "draws, {} {:016X}",
@@ -485,6 +637,85 @@ void WriteResources(std::ofstream& out, const Guest& g) {
     for (auto [st, n] : summary[kind]) out << fmt::format(" {}={}", st, n);
     out << '\n';
   }
+  out << fmt::format("texture conversion (phase 2): {} converted, {} failed\n", converted_count[1],
+                     converted_count[0]);
+  for (auto& e : conversion_errors) out << "  " << e << '\n';
+  for (auto& l : lines) out << l << '\n';
+}
+
+// Translates every shader pair the frame drew with, as the native renderer
+// would, and writes the SPIR-V (plus the microcode disassembly) to dir.
+void WriteShaders(std::ofstream& out, const std::filesystem::path& dir) {
+  namespace xg = rex::graphics;
+  tb2::native::ShaderLibrary& library = Library();
+  const Frame& f = g_frame;
+  const bool write = REXCVAR_GET(native_capture_shaders);
+  std::error_code ec;
+  if (write) std::filesystem::create_directories(dir, ec);
+  std::map<std::pair<const void*, uint64_t>, bool> translations;  // (shader, modification) -> ok
+  std::map<const void*, bool> disassembled;
+  uint32_t failed_pairs = 0;
+  std::vector<std::string> lines;
+  auto emit = [&](xg::SpirvShader& shader, xg::SpirvShaderTranslator::Modification mod,
+                  const char* kind) {
+    auto [it, inserted] = translations.try_emplace({&shader, mod.value}, false);
+    if (!inserted) return it->second;
+    const auto* t = library.Translate(shader, mod);
+    it->second = t != nullptr;
+    if (!write) return it->second;
+    const auto base = fmt::format("{}_{:016X}", kind, shader.ucode_data_hash());
+    if (!disassembled[&shader]) {
+      disassembled[&shader] = true;
+      std::ofstream(dir / (base + ".ucode.txt")) << shader.ucode_disassembly();
+    }
+    if (t) {
+      const auto& bin = t->translated_binary();
+      std::ofstream(dir / fmt::format("{}_{:016X}.spv", base, mod.value), std::ios::binary)
+          .write(reinterpret_cast<const char*>(bin.data()), std::streamsize(bin.size()));
+    }
+    return it->second;
+  };
+  for (auto& [key, draws] : f.shader_pairs) {
+    auto [vs_hash, ps_hash, program_cntl, context_misc, interpolator_cntl, surface_info, prim] = key;
+    const auto& vs_code = g_ucode[vs_hash];
+    const auto& ps_code = g_ucode[ps_hash];
+    auto* vs = library.Get(xg::xenos::ShaderType::kVertex, vs_code);
+    auto* ps = library.Get(xg::xenos::ShaderType::kPixel, ps_code);
+    tb2::native::ShaderPairState state;
+    state.sq_program_cntl.value = program_cntl;
+    state.sq_context_misc.value = context_misc;
+    state.sq_interpolator_cntl.value = interpolator_cntl;
+    xg::reg::RB_SURFACE_INFO si;
+    si.value = surface_info;
+    state.msaa_samples = si.msaa_samples;
+    state.primitive_type = xg::xenos::PrimitiveType(prim);
+    const auto mods = library.Modifications(*vs, ps, state);
+    const bool vs_ok = emit(*vs, mods.vertex, "vs");
+    const bool ps_ok = emit(*ps, mods.pixel, "ps");
+    if (!vs_ok || !ps_ok) ++failed_pairs;
+    lines.push_back(fmt::format(
+        "vs {:016X}/{:016X} ({} dwords) ps {:016X}/{:016X} ({} dwords) prim {} | {} draws | {}{} "
+        "| textures {} interpolators {:04X}",
+        vs->ucode_data_hash(), mods.vertex.value, vs_code.size(), ps->ucode_data_hash(),
+        mods.pixel.value, ps_code.size(), prim, draws, vs_ok ? "" : "VS FAILED ",
+        ps_ok ? "ok" : "PS FAILED", ps->texture_bindings().size(),
+        mods.vertex.vertex.interpolator_mask));
+  }
+  uint32_t failed = 0;
+  for (auto& [k, ok] : translations) failed += !ok;
+  out << fmt::format(
+      "\n## shaders (phase 2): {} pairs, {} translations ({} failed), {} pairs failed\n"
+      "draws: {} with unknown shaders, {} found through the D3D objects, {} object map stale; "
+      "pixel shader objects: {} checked, {} microcode address mismatches\n",
+      f.shader_pairs.size(), translations.size(), failed, failed_pairs, f.shader_unknown_draws,
+      f.shader_by_object, f.shader_object_stale, f.ps_object_checked, f.ps_object_mismatches);
+  if (write) out << fmt::format("written to {}\n", dir.string());
+  out << fmt::format(
+      "geometry: {} draws converted ({} with generated indices), {} failed; vertex fetches: {} "
+      "checked, {} beyond their buffer, {} with a computed index (not checked)\n",
+      f.geometry_converted, f.geometry_generated_indices, f.geometry_failed,
+      f.vertex_fetches_checked, f.vertex_fetches_out_of_range, f.vertex_fetches_computed);
+  for (auto& n : f.geometry_notes) out << "  " << n << '\n';
   for (auto& l : lines) out << l << '\n';
 }
 
@@ -536,7 +767,9 @@ void WriteFrame() {
   for (auto& p : f.passes)
     out << fmt::format("{:08X} {:08X} {:08X} {:08X} {:08X} {}\n", p.surface_info, p.color_info,
                        p.depth_info, p.rt0, p.ds, p.draws);
-  WriteResources(out, Guest{g_base});
+  WriteResources(out, Guest{g_base},
+                 g_out_dir / fmt::format("native_capture_{:03}_textures", g_serial));
+  WriteShaders(out, g_out_dir / fmt::format("native_capture_{:03}_shaders", g_serial));
   out << "\n## events\n";
   for (auto& e : f.events) out << e << '\n';
   REXLOG_INFO("[native] wrote {} ({} draws, {} flush mismatches, {} state mismatches)",
@@ -589,6 +822,157 @@ void CollectResources(const Guest& g, uint32_t device, const Parsed& parsed) {
     ++f.buffers[{'I', d.index_base, count * size}].draws;
   }
   for (const ShaderLoad& l : parsed.shader_loads) ++f.shaders[{l.type, l.address, l.dwords, l.hash}];
+}
+
+uint32_t g_index_offset = 0;  // VGT_INDX_OFFSET, set by the draws from their arguments
+
+// Index registers (register * 4 + component) a vertex shader's fetches use
+// after an instruction wrote them, e.g. the instancing in the crowd shaders:
+// raw vertex indices don't bound those fetches. From the microcode
+// disassembly, cached per shader.
+const std::set<uint32_t>& ComputedFetchIndices(const rex::graphics::Shader& shader) {
+  static std::unordered_map<const void*, std::set<uint32_t>> cache;
+  auto [it, inserted] = cache.try_emplace(&shader);
+  if (!inserted) return it->second;
+  // "op rN.mask, ..." (destination) and "vfetch_full rD, rN.c, vfK" (index)
+  static const std::regex kInstr(R"(([a-z_][a-z_0-9]*)\s+r(\d+)(\.([xyzw_]{4}))?)");
+  static const std::regex kFetch(R"(vfetch_full\s+\S+,\s+r(\d+)\.([xyzw]))");
+  std::map<uint32_t, uint32_t> written;  // register -> component mask written so far
+  std::istringstream lines(shader.ucode_disassembly());
+  std::string line;
+  while (std::getline(lines, line)) {
+    std::smatch m;
+    if (std::regex_search(line, m, kFetch)) {
+      const uint32_t reg = uint32_t(std::stoul(m[1])), c = uint32_t(std::string("xyzw").find(m[2].str()[0]));
+      if (written[reg] & (1u << c)) it->second.insert(reg * 4 + c);
+    }
+    if (std::regex_search(line, m, kInstr)) {
+      const std::string mask = m[4].matched ? m[4].str() : "xyzw";
+      for (uint32_t c = 0; c < 4; ++c)
+        if (mask[c] != '_') written[uint32_t(std::stoul(m[2]))] |= 1u << c;
+    }
+  }
+  return it->second;
+}
+
+// The draw's geometry as the native renderer would convert it, and whether the
+// vertices it can reach lie inside the vertex buffers its vertex shader fetches
+// from (vertex bindings: fetch constant + stride, from the microcode).
+void CheckGeometry(const Guest& g, uint32_t device, const Parsed& parsed) {
+  namespace xg = rex::graphics;
+  Frame& f = g_frame;
+  for (const RegWrite& w : parsed.regs)
+    if (w.reg == 0x2102) g_index_offset = w.value;
+  if (parsed.draws.size() != 1) return;
+  const DrawPacket& d = parsed.draws.back();
+  tb2::native::HostDraw host;
+  std::string error;
+  if (!tb2::native::ConvertDraw(g.base, {d.initiator, d.index_base, d.index_size}, host, &error)) {
+    ++f.geometry_failed;
+    if (f.geometry_notes.size() < 20) f.geometry_notes.push_back(error);
+    return;
+  }
+  ++f.geometry_converted;
+  const bool dma = ((d.initiator >> 6) & 3) == 0;
+  if (host.indexed && !dma) ++f.geometry_generated_indices;
+  if (!g_current_shader[0]) return;
+  auto* vs = Library().Get(xg::xenos::ShaderType::kVertex, g_ucode[g_current_shader[0]]);
+  const uint32_t max_index = host.indexed ? host.max_index : host.count ? host.count - 1 : 0;
+  const uint32_t max_vertex = (max_index + g_index_offset) & 0xFFFFFF;
+  const auto& computed = ComputedFetchIndices(*vs);
+  for (const auto& binding : vs->vertex_bindings()) {
+    bool computed_index = false;
+    for (const auto& a : binding.attributes) {
+      const auto& index = a.fetch_instr.operands[0];
+      if (!a.fetch_instr.is_mini_fetch &&
+          computed.count(index.storage_index * 4 + uint32_t(index.components[0])))
+        computed_index = true;
+    }
+    if (computed_index) {
+      ++f.vertex_fetches_computed;
+      continue;
+    }
+    const uint32_t at = device + kFetchConstants + binding.fetch_constant * 8;
+    const uint32_t dword1 = g.U32(at + 4);
+    const uint32_t size_words = (dword1 >> 2) & 0xFFFFFF;
+    uint32_t needed = 0;  // words of the last vertex
+    std::string attributes;
+    for (const auto& a : binding.attributes) {
+      const auto& at = a.fetch_instr.attributes;
+      const uint32_t used = a.fetch_instr.result.GetUsedResultComponents();
+      // a mask of the words read
+      const uint32_t words =
+          32 - uint32_t(std::countl_zero(xg::xenos::GetVertexFormatNeededWords(at.data_format, used)));
+      needed = std::max(needed, uint32_t(at.offset) + words);
+      attributes += fmt::format(" [offset {} format {} used {:X} words {}]", at.offset,
+                                uint32_t(at.data_format), used, words);
+    }
+    ++f.vertex_fetches_checked;
+    const uint64_t end = uint64_t(max_vertex) * binding.stride_words + needed;
+    if (end > size_words) {
+      ++f.vertex_fetches_out_of_range;
+      if (f.geometry_notes.size() < 20)
+        f.geometry_notes.push_back(fmt::format(
+            "draw {}: vertex {} (indices up to {} + offset {}) of fetch constant {} needs {} words, "
+            "buffer {:08X} has {} (stride {})",
+            f.draws - 1, max_vertex, max_index, g_index_offset, binding.fetch_constant, end,
+            g.U32(at) & ~3u, size_words, binding.stride_words) + attributes);
+    }
+  }
+}
+
+// The shaders a draw uses (see TrackShaderLoads), and the translation state.
+void TrackDrawShaders(const Guest& g, uint32_t device, const Parsed& parsed, uint32_t prim) {
+  Frame& f = g_frame;
+  const std::vector<uint64_t> loaded = TrackShaderLoads(g, parsed);
+  const uint32_t vs_object = g.U32(device + kVertexShader), decl = g.U32(device + kVertexDecl);
+  const uint32_t ps_object = g.U32(device + kPixelShader);
+  bool loaded_type[2] = {};
+  for (size_t i = 0; i < loaded.size(); ++i) {
+    const ShaderLoad& l = parsed.shader_loads[i];
+    if (!loaded[i]) continue;
+    loaded_type[l.type] = true;
+    if (l.type == 0) {
+      g_vs_by_object[{vs_object, decl}] = loaded[i];
+    } else {
+      g_ps_by_object[ps_object] = loaded[i];
+      // D3DPixelShader: microcode at *(ps + 24) + header[+40], header at ps +
+      // *(ps + 64), size in bytes at header[+44] (from the flush, sub_823B8708).
+      if (ps_object && l.address) {
+        const uint32_t header = ps_object + g.U32(ps_object + 64);
+        const uint32_t address = GpuAddress(g.U32(ps_object + 24) + g.U32(header + 40));
+        const uint32_t dwords = g.U32(header + 44) / 4;
+        ++f.ps_object_checked;
+        if (address != l.address || dwords != l.dwords) {
+          if (f.ps_object_mismatches++ < 10)
+            f.events.push_back(fmt::format(
+                "N D pixel shader object {:08X}: microcode {:08X}/{} from the object, {:08X}/{} "
+                "loaded", ps_object, address, dwords, l.address, l.dwords));
+        }
+      }
+    }
+  }
+  auto from_object = [&](int type, uint64_t found) {
+    if (loaded_type[type] || !found) return;
+    uint64_t& current = g_current_shader[type];
+    if (!current) {
+      current = found;
+      ++f.shader_by_object;
+    } else if (current != found) {
+      ++f.shader_object_stale;
+    }
+  };
+  auto vs_it = g_vs_by_object.find({vs_object, decl});
+  from_object(0, vs_it != g_vs_by_object.end() ? vs_it->second : 0);
+  auto ps_it = g_ps_by_object.find(ps_object);
+  from_object(1, ps_it != g_ps_by_object.end() ? ps_it->second : 0);
+  if (!g_current_shader[0] || !g_current_shader[1]) {
+    ++f.shader_unknown_draws;
+    return;
+  }
+  auto reg = [&](uint32_t r) { return g.U32(device + ShadowOffset(r)); };
+  ++f.shader_pairs[{g_current_shader[0], g_current_shader[1], reg(SQ_PROGRAM_CNTL),
+                    reg(SQ_CONTEXT_MISC), reg(SQ_INTERPOLATOR_CNTL), reg(RB_SURFACE_INFO), prim}];
 }
 
 // The render target state a native renderer would read.
@@ -645,6 +1029,9 @@ void EndDraw(const DrawArgs& a, uint8_t* base) {
   for (const RegWrite& w : parsed.regs) g_mirror[w.reg] = {w.value, {w.packet, n, 'D', w.via}};
   for (auto& [op, cnt] : parsed.opcodes) f.opcodes[op] += cnt;
   CollectResources(g, a.device, parsed);
+  TrackDrawShaders(g, a.device, parsed,
+                   parsed.draws.empty() ? 0 : parsed.draws.back().initiator & 0x3F);
+  CheckGeometry(g, a.device, parsed);
 
   // GPU state as rebuilt from the stream, against the shadow.
   for (auto& [reg, mv] : g_mirror) {
@@ -701,6 +1088,7 @@ void OnSwapLocked(uint8_t* base) {
       g_frames_left = std::max(1, REXCVAR_GET(native_capture_frames));
       g_mirror.clear();
       g_prev_hashes.clear();
+      g_current_shader[0] = g_current_shader[1] = 0;
       g_pending = Parsed{};
       g_ring_last = 0;
     }

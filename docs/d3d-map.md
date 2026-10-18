@@ -48,7 +48,7 @@ the draw packet. Device layout found so far:
 | `+12448` | render targets 0–3 (`D3DSurface*`, `SetRenderTarget`; also copies the surface's `+28` word into `RB_COLOR_INFO`/`RB_COLORn_INFO`) |
 | `+12464` | depth/stencil surface |
 | `+12552 + 4*s` | texture object per fetch slot (`SetTexture`: `device[3138 + s]`) |
-| `+12700` / `+12704` | pixel shader / vertex shader objects |
+| `+12700` / `+12704` | pixel shader / vertex shader objects (see [Shaders](#shaders)) |
 | `+13524` / `+13528` | a separate resource-reference list (not PM4) |
 
 All of this is verified at run time by the shadow capture (below).
@@ -229,14 +229,39 @@ the dynamic vertex data per frame, and keep resolve targets on the GPU. At
 `resolution_scale = 2` the SDK keeps resolve results in host textures only, so
 their guest memory never changes (the hashes above are of stale memory).
 
+## Shaders
+
+The draw flush (`sub_823B8708`) loads shader microcode only when a shader
+changed:
+
+- **Pixel shaders** load from memory (`IM_LOAD`). `D3DPixelShader`: header at
+  `ps + *(ps + 64)`, microcode at `*(ps + 24) + header[+40]` (virtual, converted
+  like texture addresses), size in bytes at `header[+44]`. Shader literals
+  (c254–c255 in the game's shaders) follow as `LOAD_ALU_CONSTANT`
+  (`sub_823B8330`). Checked against every pixel shader load in the captures:
+  no mismatches.
+- **Vertex shaders** are copied into the ring (`IM_LOAD_IMMEDIATE`) by
+  `sub_823B8478` and patched there for the current vertex declaration
+  (`sub_823B81E0`, `sub_823B7A30`: vertex fetch formats/offsets, as XDK D3D
+  binds vertex shaders to declarations). A `D3DVertexShader` holds microcode
+  variants: variant `i` has a record at `vs + *(vs + 8 * (112 + i)) + 872` =
+  (microcode offset from `*(vs + 32)`, size in bytes). So the same D3D object can produce several microcode blobs, and
+  the native renderer takes vertex shader microcode from the load packet the
+  flush writes for the draw (it keeps the D3D flush running anyway).
+
+Translation (phase 2): `src/native/shaders.h` - the SDK's SPIR-V translator,
+copied into `src/native/xenos/`, with the modification bits (interpolators,
+register counts, ...) chosen per vertex + pixel shader pair as the SDK's Vulkan
+backend does. The translated shaders use the SDK's binding model: vertex data
+fetched in the shader from a storage buffer (so vertex buffers upload raw),
+float/bool/loop/fetch constants and system constants in uniform buffers, one
+texture + sampler binding per fetch constant used.
+
 ## Open questions
 
 - Confirm the remaining `?` names (render states, samplers, streams).
 - Which code fills the dynamic vertex buffers (`memoryvertexbuffer.cpp`?),
   so a native renderer can upload them without hashing.
-- Resource creation (textures, vertex/index buffers, shaders) happens at load
-  time; map it from a loading-screen trace (`trace_at_start`, or F8 during a
-  load with a larger `trace_frames`).
 - `824D95C0` (182/frame from `memoryvertexbuffer.cpp` `8240FA48..`) and
   `824D9570`: small functions in the second D3D span, purpose unknown.
 - Bink video draws through `824DA078/80/90` (called from `824BA8F8..824BB368`).

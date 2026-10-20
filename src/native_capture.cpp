@@ -1261,7 +1261,15 @@ void EndDraw(const DrawArgs& a, uint8_t* base) {
   if (a.indexed) ++f.indexed;
   Scan(g, RingPos(g, a.device));
   const Parsed parsed = TakePending();
-  if (parsed.draws.size() != 1) ++f.bad_draw_packets;
+  if (parsed.draws.size() != 1) {
+    ++f.bad_draw_packets;
+    std::string n = fmt::format("B D {}: {} draw packets, {} register writes:", f.draws - 1,
+                                parsed.draws.size(), parsed.regs.size());
+    for (const DrawPacket& d : parsed.draws)
+      n += fmt::format(" {:08X} init {:08X} idx {:08X}/{:08X}", d.packet, d.initiator,
+                       d.index_base, d.index_size);
+    f.events.push_back(n);
+  }
   for (auto& note : parsed.notes) f.events.push_back(fmt::format("N D {}", note));
 
   // Flush writes against the shadow.

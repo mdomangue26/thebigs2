@@ -218,8 +218,8 @@ native `resolve_KK_*.png` (the whole destination texture after that resolve);
 texture survives in memory. Half-float resolves are also dumped raw
 (`*.rgba16f`) since PNGs clip above 1.
 
-Results (2026-10-20, RTX 4060, 1x with 4x MSAA, `out/perf/pcap1` and `pcap3`,
-10 frames each: Bink video, profile dialog, menus, gameplay):
+Results (2026-10-20, RTX 4060, 1x with 4x MSAA, `out/perf/pcap1`-`pcap6`, Bink
+video, profile dialog, menus, cutscene, gameplay):
 
 - Every draw drawn (up to 1,730 per frame, 29-36 resolves), 0 texture
   failures; with the validation layer no messages beyond the SDK's own four.
@@ -230,11 +230,23 @@ Results (2026-10-20, RTX 4060, 1x with 4x MSAA, `out/perf/pcap1` and `pcap3`,
   8-bit encode 1.1-1.5/255 (1% of pixels > 24: the 7e3 precision below).
   `native_compare`'s raw "85/255" on the 16_16 luminance chain is the PNG's
   blue channel (0 here), not the image.
-- Final gameplay frames 4-7/255, and the depth-of-field passes of cutscene
-  frames visibly missing: the composite and DOF shaders sample the scene depth
-  resolve (`0A1EF000`) as 8888, which an R32_FLOAT texture doesn't give them.
-  The first renderer fixed this in its phase 5 (a packed `depth24 << 8 |
-  stencil` R32_UINT texture, `glsl/pack_depth.comp` there): to port next.
+- **Depth resolves read as color**: the composite pass samples the scene
+  depth resolve's memory (`0A1EF000`) as `8_8_8_8` and blends its two
+  color-grading LUTs by the stencil byte; the depth-of-field passes of
+  cutscenes read it too. Depth resolves therefore also keep the console's
+  memory words, `(depth24 << 8) | stencil` (24-bit unorm or 20e4, per the EDRAM
+  depth format), drawn by `glsl/pack_depth*.frag` from the render target's
+  depth and stencil (a stencil-aspect view) into an `R32_UINT` texture that is
+  viewed in the fetch's format; depth fetch formats still get the float
+  texture. (The first renderer found this in its phase 5 and packed with a
+  compute pass over buffer copies.) Before it the final gameplay frames were
+  4-7/255 off and cutscenes lacked their depth of field; with it (`out/perf/
+  pcap4`, `pcap6`, 4 cutscene and 10 gameplay frames) final frames are
+  0.14-0.45/255 raw.
+- Captures right at a cutscene's start can compare different moments: the
+  emulator's resolves are read from memory after the Swap, while the crowd is
+  still streaming in (`pcap4` frame 8: crowd missing natively, matching in
+  every later cutscene frame).
 
 Known differences:
 

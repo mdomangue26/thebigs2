@@ -1103,7 +1103,7 @@ namespace plume {
         viewInfo.components.g = toVk(desc.componentMapping.g);
         viewInfo.components.b = toVk(desc.componentMapping.b);
         viewInfo.components.a = toVk(desc.componentMapping.a);
-        viewInfo.subresourceRange.aspectMask = toViewAspectFlags(texture->desc.flags);
+        viewInfo.subresourceRange.aspectMask = desc.stencilAspect ? VK_IMAGE_ASPECT_STENCIL_BIT : toViewAspectFlags(texture->desc.flags);
         viewInfo.subresourceRange.baseMipLevel = desc.mipSlice;
         viewInfo.subresourceRange.levelCount = mipLevels;
         viewInfo.subresourceRange.baseArrayLayer = desc.arrayIndex;

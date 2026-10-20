@@ -1051,6 +1051,9 @@ namespace plume {
         // thebigs2: an array view even of a single layer (shaders that sample
         // 2D textures as arrays).
         bool forceArray = false;
+        // thebigs2: the stencil aspect of a depth/stencil texture (sampled as
+        // unsigned integers; format: the texture's).
+        bool stencilAspect = false;
 
         RenderTextureViewDesc() = default;
 

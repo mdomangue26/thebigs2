@@ -36,7 +36,9 @@ Changes from upstream (marked `thebigs2:` in the code):
   `INV_BLEND_FACTOR_ALPHA` (constant alpha); `dynamicStencilEnabled` /
   `dynamicBlendConstantsEnabled` pipelines with
   `RenderCommandList::setStencilState` / `setBlendConstants`; texture -> buffer
-  copies of depth/stencil textures take the depth aspect.
+  copies of depth/stencil textures take the depth aspect;
+  `RenderTextureViewDesc::stencilAspect` (stencil views for the packed depth
+  resolves).
 
 To update: copy the files above from a new upstream checkout (and its
 submodules), then reapply the changes (`git diff` this folder against the

@@ -42,6 +42,8 @@ namespace tb2::native {
 
 namespace {
 
+#include "glsl/pack_depth_ms_ps.h"
+#include "glsl/pack_depth_ps.h"
 #include "glsl/present_vs.h"
 #include "glsl/resolve_ms_ps.h"
 #include "glsl/resolve_ps.h"
@@ -119,6 +121,7 @@ pl::RenderFormat ToRenderFormat(VkFormat format) {
     case VK_FORMAT_R16G16B16A16_SNORM: return F::R16G16B16A16_SNORM;
     case VK_FORMAT_R16G16B16A16_SFLOAT: return F::R16G16B16A16_FLOAT;
     case VK_FORMAT_R32_SFLOAT: return F::R32_FLOAT;
+    case VK_FORMAT_R32_UINT: return F::R32_UINT;
     case VK_FORMAT_R32G32_SFLOAT: return F::R32G32_FLOAT;
     case VK_FORMAT_R32G32B32A32_SFLOAT: return F::R32G32B32A32_FLOAT;
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return F::BC1_UNORM;
@@ -395,9 +398,10 @@ struct Image {
   bool is_3d = false, cube = false;
   uint32_t width = 1, height = 1, depth = 1, layers = 1, levels = 1;
   uint32_t samples = 1;
+  bool mutable_format = false;  // viewed in other formats of the same size
   pl::RenderTextureLayout layout = pl::RenderTextureLayout::UNKNOWN;
-  // (view dimension, swizzle, signed) -> view
-  std::map<uint32_t, std::unique_ptr<pl::RenderTextureView>> views;
+  // (view dimension, swizzle, signed, view format) -> view
+  std::map<uint64_t, std::unique_ptr<pl::RenderTextureView>> views;
   // Resolve destinations: the framebuffer resolves draw into.
   std::unique_ptr<pl::RenderFramebuffer> framebuffer;
 };
@@ -419,6 +423,12 @@ struct TextureEntry {
   Image image;
   uint64_t content_hash = 0;
   uint64_t validated_frame = 0;
+  // Depth resolves: image holds float depth (for depth fetch formats), packed
+  // the 32-bit words the console writes to memory, (depth24 << 8) | stencil,
+  // for textures that read that memory as color (the composite pass reads the
+  // scene depth as 8_8_8_8 and blends its color grading by the stencil byte).
+  bool depth = false;
+  Image packed;
   // Resolved textures hold the render target's components in its order; in
   // guest memory a resolve stores them so that sampling through the
   // destination's fetch swizzle gives that order back.
@@ -464,7 +474,7 @@ struct SetPool {
   }
 };
 
-enum ViewKind : uint32_t { kView2DArray, kView3D, kViewCube };
+enum ViewKind : uint32_t { kView2DArray, kView3D, kViewCube, kViewStencil };
 
 }  // namespace
 
@@ -505,6 +515,11 @@ struct Renderer::Impl {
   std::unique_ptr<pl::RenderPipelineLayout> resolve_layout;
   std::map<std::tuple<uint32_t, uint32_t, bool>, std::unique_ptr<pl::RenderPipeline>>
       resolve_pipelines;  // (dest format, samples, depth)
+  // Packed depth resolves (glsl/pack_depth*.frag).
+  std::unique_ptr<pl::RenderShader> pack_shader, pack_ms_shader;
+  SetPool pack_pool;
+  std::unique_ptr<pl::RenderPipelineLayout> pack_layout;
+  std::map<uint32_t, std::unique_ptr<pl::RenderPipeline>> pack_pipelines;  // samples ->
 
   Arena vertex_arena, uniform_arena, staging_arena;
   std::unordered_map<uint64_t, uint64_t> vertex_copies;  // (address, size, hash) -> offset
@@ -538,7 +553,9 @@ struct Renderer::Impl {
     image = Image{};
   }
   bool LinearFilterable(VkFormat format);
-  pl::RenderTextureView* View(Image& image, ViewKind kind, uint32_t swizzle, bool is_signed = false);
+  // view_format: another format of the same size (mutable-format images).
+  pl::RenderTextureView* View(Image& image, ViewKind kind, uint32_t swizzle, bool is_signed = false,
+                              VkFormat view_format = VK_FORMAT_UNDEFINED);
   void Transition(pl::RenderCommandList& list, Image& image, pl::RenderTextureLayout layout);
 
   RenderTarget* GetRenderTarget(const RegisterFile& regs, int color_index /* -1 = depth */);
@@ -562,6 +579,11 @@ struct Renderer::Impl {
   pl::RenderShader* Shader(const SpirvShader::Translation& translation);
   pl::RenderPipeline* Pipeline(const PipelineKey& key);
   pl::RenderPipeline* ResolvePipeline(VkFormat dest_format, uint32_t samples, bool depth);
+  pl::RenderPipeline* PackPipeline(uint32_t samples);
+  // A resolve's draw: the render target region into a destination texture.
+  void DrawResolve(Image& dest, RenderTarget& rt, pl::RenderPipeline* pipeline,
+                   pl::RenderPipelineLayout* layout, pl::RenderDescriptorSet* set,
+                   const pl::RenderRect& scissor, const void* constants, uint32_t constants_size);
 
   void Draw(const RegisterFile& regs, std::span<const uint32_t> vs_ucode,
             std::span<const uint32_t> ps_ucode, const GuestDraw& draw);
@@ -583,6 +605,10 @@ Renderer::Impl::~Impl() {
   pipeline_layouts.clear();
   resolve_layout.reset();
   shaders.clear();
+  pack_pipelines.clear();
+  pack_layout.reset();
+  pack_pool.sets.clear();
+  pack_shader.reset(), pack_ms_shader.reset();
   resolve_vs_shader.reset(), resolve_shader.reset(), resolve_ms_shader.reset();
   samplers.clear();
   point_sampler.reset();
@@ -616,7 +642,8 @@ bool Renderer::Impl::CreateImage(Image& image, pl::RenderTextureFlags flags) {
   const pl::RenderFormat format = ToRenderFormat(image.format);
   if (format == pl::RenderFormat::UNKNOWN) return false;
   if (image.cube) flags |= pl::RenderTextureFlag::CUBE;
-  if (SignedFormat(image.format) != image.format) flags |= pl::RenderTextureFlag::MUTABLE_FORMAT;
+  if (image.mutable_format || SignedFormat(image.format) != image.format)
+    flags |= pl::RenderTextureFlag::MUTABLE_FORMAT;
   pl::RenderTextureDesc desc = pl::RenderTextureDesc::Texture(
       image.is_3d ? pl::RenderTextureDimension::TEXTURE_3D : pl::RenderTextureDimension::TEXTURE_2D,
       image.width, image.height, image.depth, image.levels, image.layers, format, flags);
@@ -627,12 +654,14 @@ bool Renderer::Impl::CreateImage(Image& image, pl::RenderTextureFlags flags) {
 }
 
 pl::RenderTextureView* Renderer::Impl::View(Image& image, ViewKind kind, uint32_t swizzle,
-                                            bool is_signed) {
-  auto [it, inserted] =
-      image.views.try_emplace(uint32_t(kind) << 16 | uint32_t(is_signed) << 12 | swizzle);
+                                            bool is_signed, VkFormat view_format) {
+  auto [it, inserted] = image.views.try_emplace(uint64_t(view_format) << 32 | uint32_t(kind) << 16 |
+                                                uint32_t(is_signed) << 12 | swizzle);
   if (!inserted) return it->second.get();
   pl::RenderTextureViewDesc desc;
-  desc.format = ToRenderFormat(is_signed ? SignedFormat(image.format) : image.format);
+  const VkFormat format = view_format != VK_FORMAT_UNDEFINED ? view_format : image.format;
+  desc.format = ToRenderFormat(is_signed ? SignedFormat(format) : format);
+  desc.stencilAspect = kind == kViewStencil;
   desc.dimension = kind == kView3D     ? pl::RenderTextureViewDimension::TEXTURE_3D
                    : kind == kViewCube ? pl::RenderTextureViewDimension::TEXTURE_CUBE
                                        : pl::RenderTextureViewDimension::TEXTURE_2D;
@@ -730,8 +759,22 @@ bool Renderer::Impl::Init(const VulkanDevice* sdk_device, std::string* error) {
   layout.addDescriptorSet(resolve_pool.builder);
   layout.end();
   resolve_layout = layout.create(device);
+  pack_shader = device->createShader(pack_depth_ps, sizeof(pack_depth_ps), "main",
+                                     pl::RenderShaderFormat::SPIRV);
+  pack_ms_shader = device->createShader(pack_depth_ms_ps, sizeof(pack_depth_ms_ps), "main",
+                                        pl::RenderShaderFormat::SPIRV);
+  pack_pool.builder.begin();
+  pack_pool.builder.addTexture(0);
+  pack_pool.builder.addTexture(1);
+  pack_pool.builder.addSampler(2);
+  pack_pool.builder.end();
+  layout.begin();
+  layout.addPushConstant(0, 0, 12, pl::RenderShaderStageFlag::PIXEL);
+  layout.addDescriptorSet(pack_pool.builder);
+  layout.end();
+  pack_layout = layout.create(device);
   if (!resolve_vs_shader || !resolve_shader || !resolve_ms_shader || !point_sampler ||
-      !resolve_layout)
+      !resolve_layout || !pack_shader || !pack_ms_shader || !pack_layout)
     return fail("resolve pipeline objects");
   return true;
 }
@@ -927,22 +970,42 @@ std::pair<pl::RenderTexture*, pl::RenderTextureView*> Renderer::Impl::TextureVie
     const RegisterFile& regs, uint32_t fetch_index, xenos::FetchOpDimension dimension,
     bool is_signed) {
   const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_index);
-  if (TextureEntry* entry = GetTexture(fetch)) {
-    Image& image = entry->image;
+  TextureEntry* entry = GetTexture(fetch);
+  // A depth resolve read as color: its memory-format words, viewed in the
+  // fetch's format, sampled like a texture loaded from that memory.
+  VkFormat view_format = VK_FORMAT_UNDEFINED;
+  bool memory_order = entry && !entry->from_resolve;
+  if (entry && entry->depth && fetch.format != xenos::TextureFormat::k_24_8 &&
+      fetch.format != xenos::TextureFormat::k_24_8_FLOAT) {
+    view_format = HostTextureFormat(fetch.format);
+    if (entry->packed.texture && FormatBytes(view_format) == 4) {
+      memory_order = true;
+    } else {
+      Note(fmt::format("depth resolve {:08X} sampled as format {}: not supported",
+                       fetch.base_address << 12, uint32_t(fetch.format)));
+      entry = nullptr;
+    }
+  }
+  if (entry) {
+    Image& image = view_format != VK_FORMAT_UNDEFINED ? entry->packed : entry->image;
     const uint32_t swizzle =
-        entry->from_resolve ? ResolvedTextureSwizzle(fetch.swizzle, entry->resolve_swizzle)
-                            : GuestToHostSwizzle(fetch.swizzle, HostFormatSwizzle(image.format));
+        memory_order ? GuestToHostSwizzle(fetch.swizzle,
+                                          HostFormatSwizzle(view_format != VK_FORMAT_UNDEFINED
+                                                                ? view_format
+                                                                : image.format))
+                     : ResolvedTextureSwizzle(fetch.swizzle, entry->resolve_swizzle);
     pl::RenderTextureView* view = nullptr;
     switch (dimension) {
       case xenos::FetchOpDimension::k1D:
       case xenos::FetchOpDimension::k2D:
-        if (!image.is_3d && !image.cube) view = View(image, kView2DArray, swizzle, is_signed);
+        if (!image.is_3d && !image.cube)
+          view = View(image, kView2DArray, swizzle, is_signed, view_format);
         break;
       case xenos::FetchOpDimension::k3DOrStacked:
-        if (image.is_3d) view = View(image, kView3D, swizzle, is_signed);
+        if (image.is_3d) view = View(image, kView3D, swizzle, is_signed, view_format);
         break;
       case xenos::FetchOpDimension::kCube:
-        if (image.cube) view = View(image, kViewCube, swizzle, is_signed);
+        if (image.cube) view = View(image, kViewCube, swizzle, is_signed, view_format);
         break;
     }
     if (view) return {image.texture.get(), view};
@@ -1163,6 +1226,40 @@ pl::RenderPipeline* Renderer::Impl::ResolvePipeline(VkFormat dest_format, uint32
   desc.renderTargetBlend[0] = pl::RenderBlendDesc::Copy();
   it->second = device->createGraphicsPipeline(desc);
   return it->second.get();
+}
+
+pl::RenderPipeline* Renderer::Impl::PackPipeline(uint32_t samples) {
+  auto [it, inserted] = pack_pipelines.try_emplace(samples);
+  if (!inserted) return it->second.get();
+  pl::RenderGraphicsPipelineDesc desc;
+  desc.pipelineLayout = pack_layout.get();
+  desc.vertexShader = resolve_vs_shader.get();
+  desc.pixelShader = samples > 1 ? pack_ms_shader.get() : pack_shader.get();
+  desc.renderTargetCount = 1;
+  desc.renderTargetFormat[0] = pl::RenderFormat::R32_UINT;
+  desc.renderTargetBlend[0] = pl::RenderBlendDesc::Copy();
+  it->second = device->createGraphicsPipeline(desc);
+  return it->second.get();
+}
+
+void Renderer::Impl::DrawResolve(Image& dest, RenderTarget& rt, pl::RenderPipeline* pipeline,
+                                 pl::RenderPipelineLayout* layout, pl::RenderDescriptorSet* set,
+                                 const pl::RenderRect& scissor, const void* constants,
+                                 uint32_t constants_size) {
+  pl::RenderCommandList& list = *draw_list;
+  Transition(list, rt.image, pl::RenderTextureLayout::SHADER_READ);
+  Transition(list, dest, pl::RenderTextureLayout::COLOR_WRITE);
+  list.setFramebuffer(dest.framebuffer.get());
+  list.setGraphicsPipelineLayout(layout);
+  list.setPipeline(pipeline);
+  list.setGraphicsDescriptorSet(set, 0);
+  const pl::RenderViewport viewport(0.0f, 0.0f, float(dest.width), float(dest.height));
+  list.setViewports(&viewport, 1);
+  list.setScissors(&scissor, 1);
+  list.setGraphicsPushConstants(0, constants, 0, constants_size);
+  list.drawInstanced(3, 1, 0, 0);
+  list.setFramebuffer(nullptr);
+  ++stats.render_passes;
 }
 
 // --- Draws ---------------------------------------------------------------------
@@ -1569,7 +1666,7 @@ void Renderer::BeginFrame(const uint8_t* memory) {
   m.vertex_arena.used = m.uniform_arena.used = m.staging_arena.used = 0;
   m.vertex_copies.clear();
   m.resolved.clear();
-  m.constants_pool.used = m.resolve_pool.used = 0;
+  m.constants_pool.used = m.resolve_pool.used = m.pack_pool.used = 0;
   for (auto& [k, pool] : m.texture_pools) pool.used = 0;
   m.upload_list->begin();
   m.draw_list->begin();
@@ -1687,29 +1784,50 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
     entry->resolve_swizzle = dest.swizzle;
     Image& image = entry->image;
     pl::RenderCommandList& list = *m.draw_list;
+    // Depth resolves also keep the packed memory words.
+    entry->depth = depth;
+    Image& packed = entry->packed;
+    if (packed.texture && (!depth || packed.width != dw || packed.height != dh))
+      m.DestroyLater(packed);
+    if (depth && !packed.texture) {
+      packed.format = VK_FORMAT_R32_UINT;
+      packed.mutable_format = true;
+      packed.width = dw, packed.height = dh;
+      const pl::RenderTexture* attachment = nullptr;
+      if (m.CreateImage(packed, pl::RenderTextureFlag::RENDER_TARGET)) {
+        attachment = packed.texture.get();
+        packed.framebuffer = m.device->createFramebuffer(pl::RenderFramebufferDesc(&attachment, 1));
+      }
+      if (!packed.framebuffer) {
+        packed = Image{};
+        result.note = "packed depth texture creation failed";
+      }
+    }
     if (w && h) {
-      pl::RenderPipeline* pipeline = m.ResolvePipeline(dest_format, rt->image.samples, depth);
-      if (pipeline) {
-        m.Transition(list, rt->image, pl::RenderTextureLayout::SHADER_READ);
-        m.Transition(list, image, pl::RenderTextureLayout::COLOR_WRITE);
+      const pl::RenderRect scissor(px, py, px + int32_t(w), py + int32_t(h));
+      const int32_t offset[3] = {x0 - px, y0 - py,
+                                 regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
+                                     xenos::DepthRenderTargetFormat::kD24FS8};
+      if (pl::RenderPipeline* pipeline = m.ResolvePipeline(dest_format, rt->image.samples, depth)) {
         pl::RenderDescriptorSet* set = m.resolve_pool.Next(m.device);
         set->setTexture(0, rt->image.texture.get(), pl::RenderTextureLayout::SHADER_READ);
         set->setSampler(1, m.point_sampler.get());
-        list.setFramebuffer(image.framebuffer.get());
-        list.setGraphicsPipelineLayout(m.resolve_layout.get());
-        list.setPipeline(pipeline);
-        list.setGraphicsDescriptorSet(set, 0);
-        const pl::RenderViewport viewport(0.0f, 0.0f, float(dw), float(dh));
-        const pl::RenderRect scissor(px, py, px + int32_t(w), py + int32_t(h));
-        list.setViewports(&viewport, 1);
-        list.setScissors(&scissor, 1);
-        const int32_t offset[2] = {x0 - px, y0 - py};
-        list.setGraphicsPushConstants(0, offset, 0, sizeof(offset));
-        list.drawInstanced(3, 1, 0, 0);
-        list.setFramebuffer(nullptr);
-        ++m.stats.render_passes;
+        m.DrawResolve(image, *rt, pipeline, m.resolve_layout.get(), set, scissor, offset, 8);
       } else {
         result.note = "no resolve pipeline";
+      }
+      if (packed.texture) {
+        if (pl::RenderPipeline* pipeline = m.PackPipeline(rt->image.samples)) {
+          pl::RenderDescriptorSet* set = m.pack_pool.Next(m.device);
+          set->setTexture(0, rt->image.texture.get(), pl::RenderTextureLayout::SHADER_READ);
+          set->setTexture(1, rt->image.texture.get(), pl::RenderTextureLayout::SHADER_READ,
+                          m.View(rt->image, kViewStencil, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA));
+          set->setSampler(2, m.point_sampler.get());
+          m.DrawResolve(packed, *rt, pipeline, m.pack_layout.get(), set, scissor, offset, 12);
+          m.Transition(list, packed, pl::RenderTextureLayout::SHADER_READ);
+        } else {
+          result.note = "no depth packing pipeline";
+        }
       }
     }
     // Readback of the whole destination texture, comparable with the

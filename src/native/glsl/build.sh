@@ -8,3 +8,5 @@ G=${GLSLANG:-glslangValidator}
 "$G" -V --target-env vulkan1.1 --vn present_vs -o present_vs.h present.vert
 "$G" -V --target-env vulkan1.1 --vn resolve_ps -o resolve_ps.h resolve.frag
 "$G" -V --target-env vulkan1.1 --vn resolve_ms_ps -o resolve_ms_ps.h resolve_ms.frag
+"$G" -V --target-env vulkan1.1 --vn pack_depth_ps -o pack_depth_ps.h pack_depth.frag
+"$G" -V --target-env vulkan1.1 --vn pack_depth_ms_ps -o pack_depth_ms_ps.h pack_depth_ms.frag

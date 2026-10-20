@@ -32,6 +32,7 @@ set(THEBIGS2_SOURCES
     src/render_tweaks.cpp
     src/native_capture.cpp
     src/native/buffers.cpp
+    src/native/renderer.cpp
     src/native/shaders.cpp
     src/native/textures.cpp
     src/native/plume_device.cpp

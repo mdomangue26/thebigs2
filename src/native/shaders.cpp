@@ -10,11 +10,12 @@ namespace tb2::native {
 
 namespace xg = rex::graphics;
 
-ShaderLibrary::ShaderLibrary() {
-  // All optional features on (Vulkan 1.2+ with the usual extensions; both the
-  // desktop GPUs and the Steam Deck have them). Host render targets: no EDRAM
-  // emulation in the shaders, no resolution scaling inside them.
-  translator_ = std::make_unique<SpirvShaderTranslator>(SpirvShaderTranslator::Features(true),
+ShaderLibrary::ShaderLibrary() : ShaderLibrary(SpirvShaderTranslator::Features(true)) {}
+
+ShaderLibrary::ShaderLibrary(const SpirvShaderTranslator::Features& features) {
+  // Host render targets: no EDRAM emulation in the shaders, no resolution
+  // scaling inside them.
+  translator_ = std::make_unique<SpirvShaderTranslator>(features,
                                                         /*native_2x_msaa_with_attachments=*/true,
                                                         /*native_2x_msaa_no_attachments=*/true,
                                                         /*edram_fragment_shader_interlock=*/false);

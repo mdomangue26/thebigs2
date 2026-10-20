@@ -30,6 +30,13 @@ Changes from upstream (marked `thebigs2:` in the code):
   (`vkCmdCopyImageToBuffer`). Upstream only copies buffer -> texture and
   texture -> texture on Vulkan; a readback fell into the texture branch with a
   null destination.
+- **For the renderer** (2026-10-20): `RenderFormat::R10G10B10A2_UNORM`;
+  `RenderTextureFlag::MUTABLE_FORMAT` (signed views); `RenderTextureViewDesc::
+  forceArray` (2D arrays of one layer); `RenderBlend::BLEND_FACTOR_ALPHA` /
+  `INV_BLEND_FACTOR_ALPHA` (constant alpha); `dynamicStencilEnabled` /
+  `dynamicBlendConstantsEnabled` pipelines with
+  `RenderCommandList::setStencilState` / `setBlendConstants`; texture -> buffer
+  copies of depth/stencil textures take the depth aspect.
 
 To update: copy the files above from a new upstream checkout (and its
 submodules), then reapply the changes (`git diff` this folder against the

@@ -2,8 +2,9 @@
 
 Status: **Phases 0 (mapping) and 1 (shadow capture) done; phase 2 (resource
 conversion) done except the pipeline cache, which needs the Vulkan device of
-phase 3. Restarted 2026-10-20 on [Plume](#rendering-api-plume): Plume runs on
-the SDK's Vulkan device (self-test); phase 3 next.** Work happens on the
+phase 3. Restarted 2026-10-20 on [Plume](#rendering-api-plume); phases 3
+and 4 redone on it the same day (captured frames drawn natively, resolve by
+resolve as close to the emulator as the first renderer got); phase 5 next.** Work happens on the
 `native-renderer` branch. A first renderer written straight against Vulkan
 (phases 3-6, menus to full frames, live and detached mode, resolution scaling,
 AA options) is kept on the branch `native-renderer-vk` for reference. The game still renders through the SDK's Xenos GPU
@@ -113,10 +114,12 @@ renderer via `OnCreateImmediateDrawer`).
    conversion, untiling, mips), vertex/index buffers, shaders translated to
    SPIR-V (`src/native/`), checked against every draw of captured frames. The
    pipeline cache moves to phase 3 (it needs a Vulkan device).
-3. **First native pixels**. Draw one simple pass natively — the 2D front end
-   (menus, fonts) is the easiest — in a debug view beside the emulator.
-4. **Full frame**. Render targets and resolves without EDRAM, depth, MSAA,
-   post-processing, shadows, crowd, Bink movie textures.
+3. **First native pixels** *(done, on Plume 2026-10-20, see below)*. The 2D
+   front end (menus, fonts, Bink video) drawn natively from captured frames,
+   compared with the emulator.
+4. **Full frame** *(done, on Plume 2026-10-20, see below)*. Render targets and
+   resolves without EDRAM, depth, MSAA, post-processing, shadows, crowd, Bink
+   movie textures, checked resolve by resolve against the emulator.
 5. **Switch over**. Run without the Xenos plugin (detached mode) with our own
    swapchain and overlays; keep the emulator as a fallback setting.
 6. **Port features**. Widescreen/ultrawide, AA options, resolution scaling
@@ -146,6 +149,107 @@ with local changes (README there). Only its Vulkan backend is built.
 - Things to watch: Plume bakes the stencil reference into the pipeline (more
   pipeline variants than with dynamic state); its barrier/layout tracking is
   still marked as being refined upstream.
+
+## Phases 3 and 4 on Plume (`src/native/renderer.h`)
+
+The renderer draws a frame from the same inputs the capture reads: at every
+draw the GPU state is rebuilt from the D3D device shadow as a register file,
+plus the draw's shader microcode and draw packet; Clear and Resolve are hooked
+too. It runs on the SDK's Vulkan device through Plume (the emulator keeps
+rendering beside it) and records the frame into two command lists (texture
+uploads, then the draws) submitted at the frame's Swap. Ported 2026-10-20 from
+the first renderer (`native-renderer-vk`, commit 0eff77f), which wrote the same
+logic against raw Vulkan.
+
+- **Draw path**: a lean copy of the SDK's Vulkan backend for its host render
+  target path (`VulkanCommandProcessor::IssueDraw` / `UpdateSystemConstantValues`
+  / `UpdateBindings`, `VulkanPipelineCache`), so the translated shaders get the
+  same system constants and bindings as in the emulator. Viewport / scissor /
+  depth / color-mask helpers are the SDK's `draw_util`, copied into
+  `src/native/xenos/`. Pipelines are cached by their full state; stencil
+  reference / masks, blend constants and depth bias are dynamic (local Plume
+  additions). Plume framebuffers (render pass objects) are cached per set of
+  targets.
+- **Render targets**: one texture per EDRAM surface (base, format, pitch), 2048
+  rows tall; no EDRAM emulation. Formats that view the same EDRAM data
+  (`2_10_10_10_FLOAT` / `..._AS_16_16_16_16`, 8888 / gamma, `2_10_10_10` /
+  `AS_10_10_10_10`) share one. 8-bit gamma targets are gamma-encoded in the
+  shader (as the SDK does); 16-bit fixed formats use float textures. Depth is
+  D32_FLOAT_S8_UINT (AMD has no D24S8). MSAA targets get the guest sample
+  count.
+- **Resolves** draw a fullscreen triangle (`glsl/resolve*.frag`) that reads
+  the render target region into the destination texture as a color target:
+  the attachment converts the format, MSAA color is averaged, depth takes
+  sample 0 into an R32_FLOAT texture (as the SDK's texture cache loads 24-bit
+  depth). Destinations are keyed by address and updated in place; later draws
+  sample them, composing the sampling fetch swizzle with the inverse of the
+  destination's. Predicated tiling is drawn once at full size; each per-tile
+  resolve copies to its destination point and clears only its rectangle.
+  Every resolve is read back for comparison.
+- **Vertex data**: each vertex fetch constant's buffer is copied (deduplicated
+  per frame) into a storage buffer standing in for the SDK's 512 MB shared
+  memory, and the fetch constants handed to the shader point into it.
+- **Constants**: one constants descriptor set per draw (reused frame after
+  frame), its buffers at the draw's offsets in a per-frame arena. Float
+  constants are packed per shader as the SDK does. Literal constants come from
+  the shader objects ([d3d-map.md](d3d-map.md#shaders)).
+- **Textures** convert through phase 2's `ConvertTexture`, cached by fetch
+  constant shape and content hash. Views carry the fetch constant's swizzle;
+  2D textures are sampled as arrays; signed bindings get SNORM views of the
+  same bits (mutable-format textures).
+- **Registers outside the shadow** come from the emulator's register file at
+  the start of the frame and the packets of the frame (D3D sets the window
+  scissor per render target).
+- The SDK's `anisotropic_override` applies to the native samplers as the SDK
+  applies it.
+
+```bash
+tools/native_capture_run.sh out/perf/ncapN 15 16 --native_capture_render=true \
+    --readback_resolve=full --resolution_scale=1   # scene_msaa: on at 1x
+#   [--vulkan_validation_enabled=true: validation layer on the SDK device]
+tools/native_compare.py out/perf/ncapN/data/captures/native_capture_009_native
+```
+
+With the SDK's `--readback_resolve=full` the emulator writes each resolve back
+to guest memory; the capture reads the destination textures shortly after the
+frame's Swap (`emu_resolve_KK_*.png`, in render target order) next to the
+native `resolve_KK_*.png` (the whole destination texture after that resolve);
+`native_compare.py <dir>` compares each pair. Only the last resolve into each
+texture survives in memory. Half-float resolves are also dumped raw
+(`*.rgba16f`) since PNGs clip above 1.
+
+Results (2026-10-20, RTX 4060, 1x with 4x MSAA, `out/perf/pcap1` and `pcap3`,
+10 frames each: Bink video, profile dialog, menus, gameplay):
+
+- Every draw drawn (up to 1,730 per frame, 29-36 resolves), 0 texture
+  failures; with the validation layer no messages beyond the SDK's own four.
+- Menus and video: final frame within 0.03-0.21/255 of the emulator (raw, no
+  tone curve).
+- Gameplay: the passes (render-to-texture boards, shadow map, scene color,
+  bloom, luminance chain) within 0.0-0.3/255 after the tone curve; the scene's
+  8-bit encode 1.1-1.5/255 (1% of pixels > 24: the 7e3 precision below).
+  `native_compare`'s raw "85/255" on the 16_16 luminance chain is the PNG's
+  blue channel (0 here), not the image.
+- Final gameplay frames 4-7/255, and the depth-of-field passes of cutscene
+  frames visibly missing: the composite and DOF shaders sample the scene depth
+  resolve (`0A1EF000`) as 8888, which an R32_FLOAT texture doesn't give them.
+  The first renderer fixed this in its phase 5 (a packed `depth24 << 8 |
+  stencil` R32_UINT texture, `glsl/pack_depth.comp` there): to port next.
+
+Known differences:
+
+- 7e3 precision and the 2-bit alpha of `2_10_10_10_FLOAT` (half floats here,
+  like the SDK's host render target path); shows mostly in the 8-bit encode of
+  the HDR scene.
+- EDRAM aliasing: a resolve of a surface nobody drew this frame (a cutscene
+  frame without a shadow pass) returns other passes' EDRAM bits in the
+  emulator, a cleared image here.
+- Temporal effects (auto-exposure adapts from the previous frame's 1x1
+  luminance): in captures the previous frame's resolves come from guest
+  memory; continuous rendering (phase 5) has to keep resolved textures across
+  frames.
+- Not handled: memexport, line polygon mode (drawn filled, noted), gaps
+  between bound color targets (skipped, noted). None occur in the captures.
 
 ## Phase 2: resource conversion (`src/native/`)
 

@@ -41,7 +41,10 @@ struct ShaderPairModifications {
 
 class ShaderLibrary {
  public:
+  // Default: all optional translator features on (for offline checks); the
+  // renderer passes its device's features.
   ShaderLibrary();
+  explicit ShaderLibrary(const SpirvShaderTranslator::Features& features);
   ~ShaderLibrary();
 
   // The analyzed shader for big-endian microcode, created on first use.

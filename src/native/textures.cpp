@@ -20,7 +20,7 @@ using xg::xenos::TextureFormat;
 
 namespace {
 
-enum class Conversion { kCopy, kCtx1ToR8G8 };
+enum class Conversion { kCopy, kCtx1ToR8G8, kDepthUnorm24, kDepthFloat24 };
 
 struct FormatMapping {
   VkFormat format;
@@ -80,10 +80,12 @@ FormatMapping Mapping(TextureFormat format) {
       return {VK_FORMAT_R32G32_SFLOAT, Conversion::kCopy};
     case TextureFormat::k_32_32_32_32_FLOAT:
       return {VK_FORMAT_R32G32B32A32_SFLOAT, Conversion::kCopy};
+    // Depth (resolve targets, e.g. the shadow map): the depth as a float, like
+    // the SDK (shaders sample it as a float texture; stencil is dropped).
     case TextureFormat::k_24_8:
+      return {VK_FORMAT_R32_SFLOAT, Conversion::kDepthUnorm24};
     case TextureFormat::k_24_8_FLOAT:
-      // Depth resolve targets (the shadow map): GPU-written, raw here.
-      return {VK_FORMAT_R32_UINT, Conversion::kCopy};
+      return {VK_FORMAT_R32_SFLOAT, Conversion::kDepthFloat24};
     default:
       return {VK_FORMAT_UNDEFINED, Conversion::kCopy};
   }
@@ -208,9 +210,18 @@ bool ConvertTexture(const uint8_t* memory, const xg::xenos::xe_gpu_texture_fetch
                   fetch.endianness, slice_dst + size_t(by) * 4 * l.row_pitch + bx * 8,
                   layer_src + offset, l.row_pitch);
             } else {
-              xg::texture_conversion::CopySwapBlock(
-                  fetch.endianness, slice_dst + size_t(by) * l.row_pitch + bx * guest_bpb,
-                  layer_src + offset, guest_bpb);
+              uint8_t* dst = slice_dst + size_t(by) * l.row_pitch + bx * guest_bpb;
+              xg::texture_conversion::CopySwapBlock(fetch.endianness, dst, layer_src + offset,
+                                                    guest_bpb);
+              if (mapping.conversion == Conversion::kDepthUnorm24 ||
+                  mapping.conversion == Conversion::kDepthFloat24) {
+                uint32_t v;
+                std::memcpy(&v, dst, 4);
+                const float f = mapping.conversion == Conversion::kDepthUnorm24
+                                    ? float(v >> 8) * (1.0f / 16777215.0f)
+                                    : xg::xenos::Float20e4To32(v >> 8);
+                std::memcpy(dst, &f, 4);
+              }
             }
           }
         }
@@ -359,12 +370,6 @@ bool DecodeToRgba8(const HostTexture& t, uint32_t level, uint32_t layer,
             c[i] = Unorm8(f);
           }
           if (n == 1) c[1] = c[2] = c[0];
-          break;
-        }
-        case VK_FORMAT_R32_UINT: {  // D24S8: depth in the upper 24 bits
-          uint32_t v;
-          std::memcpy(&v, b, 4);
-          c[0] = c[1] = c[2] = uint8_t(v >> 24);
           break;
         }
         case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {

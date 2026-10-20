@@ -141,6 +141,8 @@ namespace plume {
             return VK_FORMAT_R8G8B8A8_UNORM;
         case RenderFormat::R8G8B8A8_UNORM:
             return VK_FORMAT_R8G8B8A8_UNORM;
+        case RenderFormat::R10G10B10A2_UNORM:
+            return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
         case RenderFormat::R8G8B8A8_UINT:
             return VK_FORMAT_R8G8B8A8_UINT;
         case RenderFormat::R8G8B8A8_SNORM:
@@ -269,12 +271,12 @@ namespace plume {
         }
     }
 
-    static VkImageViewType toImageViewType(RenderTextureViewDimension dimension, uint16_t arraySize) {
+    static VkImageViewType toImageViewType(RenderTextureViewDimension dimension, uint16_t arraySize, bool forceArray = false) {
         switch (dimension) {
         case RenderTextureViewDimension::TEXTURE_1D:
-            return arraySize > 1 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D;
+            return (arraySize > 1 || forceArray) ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D;
         case RenderTextureViewDimension::TEXTURE_2D:
-            return arraySize > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+            return (arraySize > 1 || forceArray) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
         case RenderTextureViewDimension::TEXTURE_3D:
             return VK_IMAGE_VIEW_TYPE_3D;
         case RenderTextureViewDimension::TEXTURE_CUBE:
@@ -391,6 +393,10 @@ namespace plume {
             return VK_BLEND_FACTOR_SRC1_ALPHA;
         case RenderBlend::INV_SRC1_ALPHA:
             return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+        case RenderBlend::BLEND_FACTOR_ALPHA:
+            return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+        case RenderBlend::INV_BLEND_FACTOR_ALPHA:
+            return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
         default:
             assert(false && "Unknown blend factor.");
             return VK_BLEND_FACTOR_MAX_ENUM;
@@ -997,6 +1003,10 @@ namespace plume {
             imageInfo.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
         }
 
+        if (desc.flags & RenderTextureFlag::MUTABLE_FORMAT) {
+            imageInfo.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        }
+
         imageFormat = imageInfo.format;
         fillSubresourceRange();
 
@@ -1087,7 +1097,7 @@ namespace plume {
         VkImageViewCreateInfo viewInfo = {};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = texture->vk;
-        viewInfo.viewType = toImageViewType(desc.dimension, arraySize);
+        viewInfo.viewType = toImageViewType(desc.dimension, arraySize, desc.forceArray);
         viewInfo.format = toVk(desc.format);
         viewInfo.components.r = toVk(desc.componentMapping.r);
         viewInfo.components.g = toVk(desc.componentMapping.g);
@@ -1615,6 +1625,16 @@ namespace plume {
 
         if (desc.dynamicDepthBiasEnabled) {
             dynamicStates.emplace_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
+        }
+
+        if (desc.dynamicStencilEnabled) {
+            dynamicStates.emplace_back(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK);
+            dynamicStates.emplace_back(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK);
+            dynamicStates.emplace_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
+        }
+
+        if (desc.dynamicBlendConstantsEnabled) {
+            dynamicStates.emplace_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
         }
 
         VkPipelineDynamicStateCreateInfo dynamicState = {};
@@ -3032,6 +3052,21 @@ namespace plume {
         setDescriptorSet(VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, activeRaytracingPipelineLayout, descriptorSet, setIndex);
     }
 
+    // thebigs2
+    void VulkanCommandList::setStencilState(uint32_t frontReference, uint32_t backReference, uint32_t frontCompareMask, uint32_t backCompareMask, uint32_t frontWriteMask, uint32_t backWriteMask) {
+        vkCmdSetStencilReference(vk, VK_STENCIL_FACE_FRONT_BIT, frontReference);
+        vkCmdSetStencilReference(vk, VK_STENCIL_FACE_BACK_BIT, backReference);
+        vkCmdSetStencilCompareMask(vk, VK_STENCIL_FACE_FRONT_BIT, frontCompareMask);
+        vkCmdSetStencilCompareMask(vk, VK_STENCIL_FACE_BACK_BIT, backCompareMask);
+        vkCmdSetStencilWriteMask(vk, VK_STENCIL_FACE_FRONT_BIT, frontWriteMask);
+        vkCmdSetStencilWriteMask(vk, VK_STENCIL_FACE_BACK_BIT, backWriteMask);
+    }
+
+    // thebigs2
+    void VulkanCommandList::setBlendConstants(const float blendConstants[4]) {
+        vkCmdSetBlendConstants(vk, blendConstants);
+    }
+
     void VulkanCommandList::setIndexBuffer(const RenderIndexBufferView *view) {
         if (view != nullptr) {
             const VulkanBuffer *interfaceBuffer = static_cast<const VulkanBuffer *>(view->buffer.ref);
@@ -3245,7 +3280,8 @@ namespace plume {
             imageCopy.bufferOffset = dstLocation.placedFootprint.offset;
             imageCopy.bufferRowLength = ((dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
             imageCopy.bufferImageHeight = ((dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
-            imageCopy.imageSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
+            // A buffer copy takes one aspect: depth of depth/stencil images.
+            imageCopy.imageSubresource.aspectMask = toViewAspectFlags(srcTexture->desc.flags);
             imageCopy.imageSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
             imageCopy.imageSubresource.layerCount = 1;
             imageCopy.imageSubresource.mipLevel = srcLocation.subresource.mipLevel;

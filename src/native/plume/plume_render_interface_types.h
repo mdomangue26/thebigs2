@@ -166,6 +166,7 @@ namespace plume {
         BC7_TYPELESS,
         BC7_UNORM,
         BC7_UNORM_SRGB,
+        R10G10B10A2_UNORM, // thebigs2
         MAX
     };
 
@@ -262,7 +263,9 @@ namespace plume {
         SRC1_COLOR,
         INV_SRC1_COLOR,
         SRC1_ALPHA,
-        INV_SRC1_ALPHA
+        INV_SRC1_ALPHA,
+        BLEND_FACTOR_ALPHA, // thebigs2: the constant's alpha (Vulkan only)
+        INV_BLEND_FACTOR_ALPHA
     };
 
     enum class RenderBlendOperation {
@@ -441,7 +444,9 @@ namespace plume {
             DEPTH_TARGET = 1U << 1,
             STORAGE = 1U << 2,
             UNORDERED_ACCESS = 1U << 3,
-            CUBE = 1U << 4
+            CUBE = 1U << 4,
+            // thebigs2: views may use other formats of the same size (signed views).
+            MUTABLE_FORMAT = 1U << 5
         };
     };
 
@@ -542,6 +547,7 @@ namespace plume {
             return 8;
         case RenderFormat::R8G8B8A8_TYPELESS:
         case RenderFormat::R8G8B8A8_UNORM:
+        case RenderFormat::R10G10B10A2_UNORM:
         case RenderFormat::R8G8B8A8_UINT:
         case RenderFormat::R8G8B8A8_SNORM:
         case RenderFormat::R8G8B8A8_SINT:
@@ -625,6 +631,7 @@ namespace plume {
         case RenderFormat::R32G32_SINT:
         case RenderFormat::R8G8B8A8_TYPELESS:
         case RenderFormat::R8G8B8A8_UNORM:
+        case RenderFormat::R10G10B10A2_UNORM:
         case RenderFormat::R8G8B8A8_UINT:
         case RenderFormat::R8G8B8A8_SNORM:
         case RenderFormat::R8G8B8A8_SINT:
@@ -1041,6 +1048,9 @@ namespace plume {
         uint32_t arraySize = UINT32_MAX;
         uint32_t arrayIndex = 0;
         RenderComponentMapping componentMapping;
+        // thebigs2: an array view even of a single layer (shaders that sample
+        // 2D textures as arrays).
+        bool forceArray = false;
 
         RenderTextureViewDesc() = default;
 
@@ -1286,6 +1296,10 @@ namespace plume {
         float depthBiasClamp = 0.0f;
         float slopeScaledDepthBias = 0.0f;
         bool dynamicDepthBiasEnabled = false;
+        // thebigs2: stencil masks / reference and blend constants set on the
+        // command list (setStencilState, setBlendConstants) instead.
+        bool dynamicStencilEnabled = false;
+        bool dynamicBlendConstantsEnabled = false;
         bool depthEnabled = false;
         bool depthWriteEnabled = false;
         bool stencilEnabled = false;

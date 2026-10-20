@@ -342,6 +342,8 @@ namespace plume {
         void discardTexture(const RenderTexture* texture) override;
         void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) override;
         void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
+        void setStencilState(uint32_t frontReference, uint32_t backReference, uint32_t frontCompareMask, uint32_t backCompareMask, uint32_t frontWriteMask, uint32_t backWriteMask) override;
+        void setBlendConstants(const float blendConstants[4]) override;
         void checkActiveRenderPass();
         void endActiveRenderPass();
         void setDescriptorSet(VkPipelineBindPoint bindPoint, const VulkanPipelineLayout *pipelineLayout, const RenderDescriptorSet *descriptorSet, uint32_t setIndex);

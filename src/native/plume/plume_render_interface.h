@@ -150,6 +150,10 @@ namespace plume {
         virtual void discardTexture(const RenderTexture* texture) = 0; // D3D12 only.
         virtual void resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) = 0;
         virtual void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) = 0;
+        // thebigs2: dynamic state of pipelines created with dynamicStencilEnabled /
+        // dynamicBlendConstantsEnabled (Vulkan only).
+        virtual void setStencilState(uint32_t frontReference, uint32_t backReference, uint32_t frontCompareMask, uint32_t backCompareMask, uint32_t frontWriteMask, uint32_t backWriteMask) { assert(false && "Not implemented."); }
+        virtual void setBlendConstants(const float blendConstants[4]) { assert(false && "Not implemented."); }
 
         // Concrete implementation shortcuts.
         inline void barriers(RenderBarrierStages stages, const RenderBufferBarrier &barrier) {

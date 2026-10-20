@@ -15,9 +15,13 @@
 //   sub_82491C20(this, index, tile, ...): tile rectangles (unused without tiling)
 
 #include <rex/cvar.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
+#include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
+#include <rex/ui/vulkan/provider.h>
 
 #include "render_trace.h"
 
@@ -44,4 +48,27 @@ extern "C" REX_FUNC(sub_82491CB8) {
     ctx.r5.u64 = 0;
   }
   [[clang::musttail]] return __imp__sub_82491CB8(ctx, base);
+}
+
+// Which EDRAM emulation path the GPU emulation uses, logged at startup: the
+// SDK falls back from "fsi" to host render targets without saying so on GPUs
+// without fragment shader interlock (and the related features its FSI path
+// needs - the same check as VulkanRenderTargetCache::Initialize).
+void TB2_LogRenderTargetPath() {
+  auto* graphics = rex::system::kernel_state()->emulator()->graphics_system();
+  auto* provider =
+      graphics ? dynamic_cast<rex::ui::vulkan::VulkanProvider*>(graphics->provider()) : nullptr;
+  if (!provider) return;  // not Vulkan
+  const auto& p = provider->vulkan_device()->properties();
+  const bool interlock = p.fragmentShaderSampleInterlock || p.fragmentShaderPixelInterlock;
+  const bool fsi_supported =
+      interlock && p.fragmentStoresAndAtomics && p.sampleRateShading && p.standardSampleLocations;
+  const std::string requested = rex::cvar::GetFlagByName("render_target_path_vulkan");
+  const bool fsi = requested == "fsi" && fsi_supported;
+  REXLOG_INFO("EDRAM path: {} (requested \"{}\"; {}: fragment shader interlock {}, {}){}",
+              fsi ? "fsi" : "host render targets", requested, p.deviceName,
+              interlock ? "yes" : "no", fsi_supported ? "FSI path supported" : "FSI path not supported",
+              requested == "fsi" && !fsi_supported
+                  ? " - consider resolution_scale = 1 and render_target_path_vulkan = \"host\""
+                  : "");
 }

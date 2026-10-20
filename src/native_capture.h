@@ -15,6 +15,10 @@ void NativeCaptureInit(const std::filesystem::path& out_dir);
 void NativeCaptureOnSwap(uint8_t* base, uint32_t front_buffer);
 void NativeCaptureAfterSwap(uint8_t* base);
 
+// The game waits for the GPU (D3D's poll loop): the native renderer's worker
+// has to catch up first, as it reads guest memory the game may then reuse.
+void NativeWaitForRenderer();
+
 // Releases the native renderer (app shutdown, before the SDK's teardown).
 void NativeCaptureShutdown();
 

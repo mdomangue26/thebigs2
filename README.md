@@ -171,9 +171,11 @@ Settings live in **`thebigs2.toml`**:
 | `anisotropic_override` | `3` | Texture filtering: `-1` = the game's own, `0` = off, `1`–`5` = forced 1x–16x |
 | `gpu_backend` | `"vulkan"` | Graphics API. Windows only: `"d3d12"` is the alternative (untested, see section 6) |
 | `frame_rate` | `30` | Frame rate in matches: `30` (the game's own) or `60` — **60 is experimental** (see below). Replaces `fps_60`, which still works |
-| `scene_msaa` | automatic | The game's 4x MSAA on the main scene; automatic = on at 1x, off at 2x+ and on the Steam Deck (see below) |
+| `scene_msaa` | automatic | The game's 4x MSAA on the main scene; automatic = on at 1x, off at 2x+ and on the Steam Deck; with `native_renderer` on at every scale except on the Deck (see below) |
 | `native_renderer` | `false` | Draw with the native Vulkan renderer instead of the GPU emulation — **experimental** (see *Native renderer*) |
 | `native_detached` | `false` | With `native_renderer`: the GPU emulation stops drawing altogether |
+| `native_msaa` | `0` | With `native_renderer`: MSAA samples for the game's multisampled main scene (`2`, `4`, `8`; `0` = the game's 4x). Needs `scene_msaa` |
+| `native_fxaa` | `false` | With `native_renderer`: FXAA on the final image (cheap anti-aliasing, e.g. with `scene_msaa = false`) |
 | `fps_log_interval` | `0` | Log the frame rate every N seconds (`0` = off) |
 | `bind_quit` | `"F10"` | Quit key |
 | `mnk_mode` | `true` | Keyboard plays as player 1's controller (alongside the first pad) |
@@ -393,9 +395,16 @@ also stops the GPU emulation from drawing (it still runs the command stream
 for synchronization). Frames match the emulator's to about 1/255. It follows
 `resolution_scale` (1x-4x, without the emulator's EDRAM limits); at 2x it holds
 60 fps where the emulator's 2x path is GPU-bound at 48-55 (RTX 4060, with
-`frame_rate = 60`). It works only with the Vulkan backend, and its work runs on
-the game's render thread: at the plate that is about the same CPU time per
-frame as the emulator's GPU thread. Development notes:
+`frame_rate = 60`). It works only with the Vulkan backend. Its work runs on a thread of
+its own beside the game's render thread (at the plate 60 fps leaves both about
+half idle on a Ryzen 5 5600).
+
+Anti-aliasing with the native renderer: the game's 4x MSAA (`scene_msaa`)
+costs only GPU time there (the console's 3-tile rendering is drawn once), so
+it stays on at every resolution scale on the desktop; `native_msaa = 8` raises
+it to 8x, `2` lowers it. `native_fxaa = true` smooths edges after the fact,
+much cheaper than MSAA (a choice for the Steam Deck, where `scene_msaa` is off
+by default). Development notes:
 [docs/native-renderer.md](docs/native-renderer.md).
 
 ### Quitting and hotkeys

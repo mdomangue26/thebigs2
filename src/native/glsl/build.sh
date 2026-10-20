@@ -11,3 +11,4 @@ G=${GLSLANG:-glslangValidator}
 "$G" -V --target-env vulkan1.1 --vn pack_depth_ps -o pack_depth_ps.h pack_depth.frag
 "$G" -V --target-env vulkan1.1 --vn pack_depth_ms_ps -o pack_depth_ms_ps.h pack_depth_ms.frag
 "$G" -V --target-env vulkan1.1 --vn present_gamma_table_ps -o present_gamma_table_ps.h present_gamma_table.frag
+"$G" -V --target-env vulkan1.1 --vn present_fxaa_ps -o present_fxaa_ps.h present_fxaa.frag

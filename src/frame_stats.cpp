@@ -195,6 +195,7 @@ REXCVAR_DEFINE_INT32(gpu_wait_sleep_us, 100, "The Bigs 2/Debug",
 extern "C" REX_FUNC(__imp__sub_823B3310);
 extern "C" REX_FUNC(sub_823B3310) {
   TB2_TRACE_HOOKED(0x823B3310);
+  tb2::NativeWaitForRenderer();  // the native renderer is part of "the GPU"
   __imp__sub_823B3310(ctx, base);
   const int32_t sleep_us = REXCVAR_GET(gpu_wait_sleep_us);
   if (ctx.r3.u32 != 0 && sleep_us > 0) {

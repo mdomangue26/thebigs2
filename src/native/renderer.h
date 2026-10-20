@@ -131,6 +131,11 @@ class Renderer {
   // Debug: log every draw; dump the log of frames whose front buffer has an
   // unusually bright patch (and of the last normal frame) to dir.
   void SetDebugFrames(const std::string& dir);
+  // Sample count of the render targets the game draws with MSAA (its main
+  // scene): 2, 4 or 8, clamped to the device; 0 = the game's own (4x).
+  void SetMsaaSamples(uint32_t samples);
+  // FXAA on the presented frame (after the gamma ramp).
+  void SetFxaa(bool fxaa);
 
   const RendererStats& stats() const;
   std::string DeviceName() const;

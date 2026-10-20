@@ -48,6 +48,8 @@
 #include <bit>
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <set>
 #include <cstdio>
 #include <cstring>
@@ -62,6 +64,7 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <pthread.h>
 #include <csignal>
 #endif
 
@@ -117,6 +120,12 @@ REXCVAR_DEFINE_STRING(native_debug_skip_draws, "", "The Bigs 2/Debug",
 REXCVAR_DEFINE_BOOL(native_debug_frames, false, "The Bigs 2/Debug",
                     "Native renderer: dump the draw logs of frames with an unusually bright "
                     "patch next to the captures");
+REXCVAR_DEFINE_INT32(native_msaa, 0, "The Bigs 2/Native renderer",
+                     "Native renderer: MSAA samples for the game's multisampled main scene "
+                     "(2, 4 or 8; 0 = the game's 4x). Needs scene_msaa");
+REXCVAR_DEFINE_BOOL(native_fxaa, false, "The Bigs 2/Native renderer",
+                    "Native renderer: FXAA on the presented frame (cheap anti-aliasing, e.g. "
+                    "without scene_msaa)");
 REXCVAR_DEFINE_INT32(native_stats_interval, 0, "The Bigs 2/Native renderer",
                      "Log the native renderer's statistics every this many frames (0 = never)");
 
@@ -1061,25 +1070,83 @@ std::string Targets(const Guest& g, uint32_t device) {
                      reg(RB_SURFACE_INFO), reg(RB_COLOR_INFO), reg(RB_DEPTH_INFO));
 }
 
-// --- Native rendering (phase 3) -------------------------------------------------
+// --- Native rendering -----------------------------------------------------------
 //
-// With native_capture_render, every captured frame is also drawn by the native
-// renderer: the register file below is rebuilt from the shadow at each draw,
-// Clear and Resolve (registers the shadow doesn't hold keep the values the
-// emulator's register file had at the start of the frame - listed in the
-// capture file), and the draw's shaders come from the tracked microcode.
+// The hooks (render thread) record what the native renderer needs as commands:
+// the draw's shaders and packet, a raw copy of the D3D device shadow, and the
+// registers packets set outside it. A worker thread rebuilds the register file
+// from them and runs the renderer (src/native/renderer.h), so its work doesn't
+// add to the game's frame time. Guest memory (vertex / index buffers, textures)
+// is read by the worker, later than the draw call - as the GPU would read it.
+// The game reuses that memory once the GPU is done with it, so when the game
+// waits for the GPU (sub_823B3310) it waits for the worker too
+// (NativeWaitForRenderer), and the render thread stays at most a frame ahead.
 
-std::unique_ptr<tb2::native::Renderer> g_renderer;
+std::unique_ptr<tb2::native::Renderer> g_renderer;  // the worker's, once it runs
 bool g_renderer_failed = false;
 bool g_live_failed = false;
-bool g_render_frame = false;    // this frame is being drawn natively
+bool g_render_frame = false;     // this frame is being drawn natively (render thread)
 bool g_native_readback = false;  // and its resolves are read back (captures)
-std::unique_ptr<rex::graphics::RegisterFile> g_regs;
+// Written by the worker, read by the render thread once the worker is idle.
 std::vector<tb2::native::ResolvedImage> g_native_resolves;
 std::string g_native_status;
 tb2::native::RendererStats g_native_stats;
-uint32_t g_native_unknown_shaders = 0, g_native_literal_entries = 0;
 std::vector<std::string> g_native_seeded;  // nonzero registers outside the shadow
+std::atomic<uint32_t> g_native_literal_entries{0};
+uint32_t g_native_unknown_shaders = 0;  // render thread
+uint32_t g_native_resolve_count = 0;    // render thread: resolves recorded this frame
+
+// The part of the device shadow a command copies (all register blocks, the
+// constants and the shader object pointers).
+constexpr uint32_t kShadowFirst = kFetchConstants, kShadowEnd = kVertexShader + 4;
+
+struct Command {
+  enum class Type : uint8_t { kBeginFrame, kDraw, kClear, kResolve, kEndFrame };
+  Type type = Type::kDraw;
+  bool tiling = false, has_rect = false, has_point = false, readback = false, capturing = false;
+  bool live = false;  // BeginFrame: rendering every frame (resolves stay valid across frames)
+  bool has_shadow = false, has_ramp = false;
+  uint32_t shadow = 0;    // offset of the shadow copy in Batch::bytes
+  uint32_t ring_end = 0;  // Batch::ring entries before this are applied first
+  uint32_t index_offset = 0;
+  const std::vector<uint32_t>* vs = nullptr;  // g_ucode entries (never removed)
+  const std::vector<uint32_t>* ps = nullptr;
+  tb2::native::GuestDraw draw{};
+  // Clear / Resolve
+  uint32_t flags = 0, color = 0, stencil = 0, bound = 0;
+  float depth = 0;
+  int32_t rect[4] = {}, point[2] = {};
+  uint32_t fetch[6] = {};
+  float clear_color[4] = {};
+  // EndFrame
+  uint32_t frame = 0, front_buffer = 0, ramp = 0;  // ramp: offset of 256 dwords in bytes
+  uint32_t unknown_shaders = 0, discontinuities = 0, segments = 0, shader_stale = 0;
+};
+
+struct Batch {
+  std::vector<Command> commands;
+  std::vector<uint8_t> bytes;
+  std::vector<std::pair<uint32_t, uint32_t>> ring;  // (register, value) in stream order
+  void Clear() {
+    commands.clear();
+    bytes.clear();
+    ring.clear();
+  }
+};
+
+struct Worker {
+  std::thread thread;
+  std::mutex mutex;
+  std::condition_variable work, progress;
+  std::deque<std::unique_ptr<Batch>> queue;
+  std::vector<std::unique_ptr<Batch>> spare;
+  bool busy = false, stop = false;
+  uint32_t frames_done = 0;  // frame number of the last EndFrame executed
+  // The worker's own state.
+  std::unique_ptr<rex::graphics::RegisterFile> regs;
+  std::map<uint32_t, uint32_t> ring_regs;
+} g_worker;
+std::unique_ptr<Batch> g_batch;  // being recorded (render thread)
 
 // Literal constants D3D loads with a shader (sub_823B8330, called from the
 // shader flush sub_823B8708): a table at header + *(header + 20), *(table + 16)
@@ -1098,37 +1165,46 @@ void OverlayLiterals(const Guest& g, uint32_t header, uint32_t base,
     const uint32_t data = base + g.U32(entry + 4);
     for (uint32_t i = 0; i < dwords && vec4 * 4 + i < 2048; ++i)
       regs[0x4000 + vec4 * 4 + i] = g.U32(data + i * 4);
-    ++g_native_literal_entries;
+    g_native_literal_entries.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
 bool InShadow(uint32_t reg) { return reg == 0x2102 || ShadowOffset(reg) != 0; }
 
 void NoteRingRegister(uint32_t reg, uint32_t value) {
-  if (reg >= 0x2000 && reg < 0x4000 && !InShadow(reg)) g_ring_regs[reg] = value;
+  if (reg < 0x2000 || reg >= 0x4000 || InShadow(reg)) return;
+  g_ring_regs[reg] = value;
+  if (g_batch) g_batch->ring.emplace_back(reg, value);
 }
 
-// The GPU state as the native renderer reads it at a draw / Clear / Resolve.
-void FillRegisters(const Guest& g, uint32_t device) {
-  auto& regs = *g_regs;
+// Worker: the GPU state at a draw / Clear / Resolve, from the command's copy
+// of the shadow.
+void FillRegisters(const Batch& batch, const Command& c) {
+  auto& regs = *g_worker.regs;
+  const uint8_t* shadow = batch.bytes.data() + c.shadow - kShadowFirst;
+  auto u32 = [&](uint32_t offset) {
+    uint32_t v;
+    std::memcpy(&v, shadow + offset, 4);
+    return __builtin_bswap32(v);
+  };
   auto copy = [&](uint32_t reg, uint32_t offset, uint32_t count) {
-    for (uint32_t i = 0; i < count; ++i) regs[reg + i] = g.U32(device + offset + i * 4);
+    for (uint32_t i = 0; i < count; ++i) regs[reg + i] = u32(offset + i * 4);
   };
   for (const Block& b : kBlocks) copy(b.reg, b.offset, b.count);
   copy(0x4000, kAluConstants, 2048);
   copy(0x4800, kFetchConstants, 32 * 6);
-  regs[0x2102] = g_index_offset;
-  for (auto [reg, value] : g_ring_regs) regs[reg] = value;
-  if (g_tiling) {
+  regs[0x2102] = c.index_offset;
+  for (auto [reg, value] : g_worker.ring_regs) regs[reg] = value;
+  if (c.tiling) {
     // Predicated tiling: the GPU replays the scene per tile with a tile-sized
     // window scissor; the native renderer draws it once, at full size.
     regs[0x2080] = 0;           // PA_SC_WINDOW_OFFSET
     regs[0x2081] = 0x80000000;  // PA_SC_WINDOW_SCISSOR_TL (window offset disabled)
     regs[0x2082] = 0x20002000;  // PA_SC_WINDOW_SCISSOR_BR: 8192x8192
   }
-  if (uint32_t vs = g.U32(device + kVertexShader))
-    OverlayLiterals(g, vs + 872, g.U32(vs + 32), regs);
-  if (uint32_t ps = g.U32(device + kPixelShader)) OverlayLiterals(g, ps + 40, g.U32(ps + 24), regs);
+  const Guest g{g_base};
+  if (uint32_t vs = u32(kVertexShader)) OverlayLiterals(g, vs + 872, g.U32(vs + 32), regs);
+  if (uint32_t ps = u32(kPixelShader)) OverlayLiterals(g, ps + 40, g.U32(ps + 24), regs);
 }
 
 // Surfaces D3D has set: bits 0-3 render targets, bit 4 depth / stencil.
@@ -1148,6 +1224,204 @@ uint32_t ResolutionScale() {
 rex::graphics::GraphicsSystem* Graphics() {
   return static_cast<rex::graphics::GraphicsSystem*>(
       rex::system::kernel_state()->emulator()->graphics_system());
+}
+
+void WorkerBeginFrame(const Command& c) {
+  auto& w = g_worker;
+  if (!w.regs) w.regs = std::make_unique<rex::graphics::RegisterFile>();
+  // Seed with the emulator's GPU registers for what the shadow doesn't hold.
+  if (c.capturing) g_native_seeded.clear();
+  if (auto* graphics = Graphics()) {
+    std::memcpy(w.regs->values, graphics->register_file()->values, sizeof(w.regs->values));
+    for (uint32_t r = 0x2000; c.capturing && r < 0x2400; ++r)
+      if (w.regs->values[r] && !InShadow(r) && g_native_seeded.size() < 64)
+        g_native_seeded.push_back(fmt::format("{:04X}={:08X}", r, w.regs->values[r]));
+  }
+  g_native_literal_entries.store(0, std::memory_order_relaxed);
+  g_renderer->SetKeepResolves(REXCVAR_GET(native_keep_resolves));
+  g_renderer->SetMsaaSamples(uint32_t(std::clamp(REXCVAR_GET(native_msaa), 0, 8)));
+  g_renderer->SetFxaa(REXCVAR_GET(native_fxaa));
+  if (REXCVAR_GET(native_debug_frames)) {
+    std::error_code ec;
+    std::filesystem::create_directories(g_out_dir, ec);
+    g_renderer->SetDebugFrames(g_out_dir.string());
+  }
+  {
+    unsigned first = 0, end = 0;
+    std::sscanf(REXCVAR_GET(native_debug_skip_draws).c_str(), "%u-%u", &first, &end);
+    g_renderer->SetSkipDraws(first, end);
+  }
+  g_renderer->BeginFrame(g_base, c.readback, c.live);
+}
+
+void WorkerEndFrame(const Batch& batch, const Command& c) {
+  std::string error;
+  const bool live = g_live.load(std::memory_order_relaxed);
+  tb2::native::PresentRequest present;
+  if (live) {
+    auto* graphics = Graphics();
+    present.presenter = graphics->presenter();
+    present.frontbuffer_base = c.front_buffer;
+    if (c.has_ramp) present.gamma_ramp = reinterpret_cast<const uint32_t*>(batch.bytes.data() + c.ramp);
+  }
+  std::vector<tb2::native::ResolvedImage> sync;
+  if (!g_renderer->EndFrame(live ? &present : nullptr,
+                            c.readback                        ? &g_native_resolves
+                            : REXCVAR_GET(native_sync_frames) ? &sync
+                                                              : nullptr,
+                            &error)) {
+    g_native_status += "; frame failed: " + error;
+    static int logged = 0;
+    if (live && logged++ < 10) REXLOG_ERROR("[native] frame failed: {}", error);
+  }
+  const auto& stats = g_renderer->stats();
+  if (const int interval = REXCVAR_GET(native_stats_interval);
+      live && interval > 0 && c.frame % uint32_t(interval) == 0) {
+    REXLOG_INFO(
+        "[native] frame {}: {} draws ({} skipped, {} occlusion queries, {} unknown shaders), {} "
+        "clears, {} resolves, {} passes, {} pipelines and {} textures new ({} KB), {} texture "
+        "failures, {} resolved textures overwritten, {} uses of them; GPU {:.2f} ms",
+        c.frame, stats.draws, stats.draws_skipped, stats.viz_query_draws, c.unknown_shaders,
+        stats.clears, stats.resolves, stats.render_passes, stats.pipelines_created,
+        stats.textures_uploaded, stats.upload_bytes >> 10, stats.texture_failures,
+        stats.resolves_overwritten, stats.textures_from_resolves, stats.gpu_ms_previous);
+    for (const auto& n : stats.notes) REXLOG_INFO("[native]   {}", n);
+    if (!stats.gpu_pass_ms.empty()) {
+      std::string passes;
+      for (float ms : stats.gpu_pass_ms) passes += fmt::format(" {:.2f}", ms);
+      REXLOG_INFO("[native]   GPU ms up to each resolve:{}", passes);
+    }
+    REXLOG_INFO("[native]   ring: {} discontinuities, {} segment switches; shader object map "
+                "disagreed with the tracked shaders {} times",
+                c.discontinuities, c.segments, c.shader_stale);
+  }
+  if (c.capturing) g_native_stats = stats;
+}
+
+void WorkerExecute(const Batch& batch) {
+  auto& w = g_worker;
+  size_t ring_applied = 0;
+  auto apply_ring = [&](size_t end) {
+    for (; ring_applied < end; ++ring_applied) w.ring_regs[batch.ring[ring_applied].first] =
+                                                   batch.ring[ring_applied].second;
+  };
+  for (const Command& c : batch.commands) {
+    apply_ring(c.ring_end);
+    auto& regs = *(w.regs ? w.regs : (w.regs = std::make_unique<rex::graphics::RegisterFile>()));
+    if (c.has_shadow) FillRegisters(batch, c);
+    switch (c.type) {
+      case Command::Type::kBeginFrame:
+        WorkerBeginFrame(c);
+        break;
+      case Command::Type::kDraw:
+        regs[0x21FC] = c.draw.initiator;   // VGT_DRAW_INITIATOR
+        regs[0x21FA] = c.draw.index_base;  // VGT_DMA_BASE
+        regs[0x21FB] = c.draw.index_size;  // VGT_DMA_SIZE
+        g_renderer->Draw(regs, *c.vs, *c.ps, c.draw);
+        break;
+      case Command::Type::kClear:
+        g_renderer->Clear(regs, c.flags, c.color, c.depth, c.stencil, c.bound);
+        break;
+      case Command::Type::kResolve:
+        g_renderer->Resolve(regs, c.flags, c.has_rect ? c.rect : nullptr,
+                            c.has_point ? c.point : nullptr, c.fetch, c.clear_color, c.depth, 0);
+        break;
+      case Command::Type::kEndFrame:
+        WorkerEndFrame(batch, c);
+        {
+          std::lock_guard lock(w.mutex);
+          w.frames_done = c.frame;
+        }
+        w.progress.notify_all();
+        break;
+    }
+  }
+  apply_ring(batch.ring.size());
+}
+
+void WorkerMain() {
+#if !defined(_WIN32)
+  pthread_setname_np(pthread_self(), "Native Renderer");
+#endif
+  auto& w = g_worker;
+  for (;;) {
+    std::unique_ptr<Batch> batch;
+    {
+      std::unique_lock lock(w.mutex);
+      w.work.wait(lock, [&] { return w.stop || !w.queue.empty(); });
+      if (w.queue.empty()) break;  // stopping, nothing left
+      batch = std::move(w.queue.front());
+      w.queue.pop_front();
+      w.busy = true;
+    }
+    WorkerExecute(*batch);
+    batch->Clear();
+    {
+      std::lock_guard lock(w.mutex);
+      w.spare.push_back(std::move(batch));
+      w.busy = false;
+    }
+    w.progress.notify_all();
+  }
+}
+
+void StartWorker() {
+  if (g_worker.thread.joinable()) return;
+  g_worker.stop = false;
+  g_batch = std::make_unique<Batch>();
+  g_worker.thread = std::thread(WorkerMain);
+}
+
+// Hands what has been recorded to the worker.
+void FlushCommands() {
+  if (!g_batch || (g_batch->commands.empty() && g_batch->ring.empty())) return;
+  auto& w = g_worker;
+  {
+    std::lock_guard lock(w.mutex);
+    w.queue.push_back(std::move(g_batch));
+    if (!w.spare.empty()) {
+      g_batch = std::move(w.spare.back());
+      w.spare.pop_back();
+    }
+  }
+  if (!g_batch) g_batch = std::make_unique<Batch>();
+  w.work.notify_one();
+}
+
+// Waits until the worker has executed everything recorded so far.
+void WaitForWorker() {
+  if (!g_worker.thread.joinable()) return;
+  FlushCommands();
+  std::unique_lock lock(g_worker.mutex);
+  g_worker.progress.wait(lock, [] { return g_worker.queue.empty() && !g_worker.busy; });
+}
+
+void StopWorker() {
+  if (!g_worker.thread.joinable()) return;
+  FlushCommands();
+  {
+    std::lock_guard lock(g_worker.mutex);
+    g_worker.stop = true;
+  }
+  g_worker.work.notify_one();
+  g_worker.thread.join();
+}
+
+// Render thread: records a command, with a copy of the device shadow if
+// device is set.
+void Record(Command c, const Guest& g, uint32_t device) {
+  Batch& b = *g_batch;
+  if (device) {
+    c.has_shadow = true;
+    c.shadow = uint32_t(b.bytes.size());
+    const uint8_t* src = g.Ptr(device + kShadowFirst);
+    b.bytes.insert(b.bytes.end(), src, src + (kShadowEnd - kShadowFirst));
+  }
+  c.tiling = g_tiling;
+  c.index_offset = g_index_offset;
+  c.ring_end = uint32_t(b.ring.size());
+  b.commands.push_back(c);
+  if (b.commands.size() >= 64) FlushCommands();
 }
 
 // Live rendering (native_renderer): on the SDK's Vulkan device, so frames can
@@ -1174,15 +1448,15 @@ void StartLive() {
   if (REXCVAR_GET(native_detached)) rex::cvar::SetFlagByName("gpu_skip_draws", "true");
   REXLOG_INFO("[native] {}{}", g_native_status,
               REXCVAR_GET(native_detached) ? ", emulator GPU drawing off" : "");
+  StartWorker();
   g_live.store(true);
 }
 
-void BeginNativeFrame(uint8_t* base) {
+void BeginNativeFrame(const Guest& g) {
   g_render_frame = false;
   g_tiling = false;  // tiling never spans a Swap
-  g_native_unknown_shaders = g_native_literal_entries = 0;
+  g_native_unknown_shaders = g_native_resolve_count = 0;
   const bool capturing = Capturing(), live = g_live.load(std::memory_order_relaxed);
-  if (capturing) g_native_resolves.clear();
   if (!live && (!capturing || !REXCVAR_GET(native_capture_render) || g_renderer_failed)) return;
   if (!g_renderer) {
     std::string error = "the GPU backend isn't Vulkan";
@@ -1199,29 +1473,19 @@ void BeginNativeFrame(uint8_t* base) {
     if (REXCVAR_GET(native_page_watch))
       g_renderer->WatchGuestMemory(rex::system::kernel_state()->memory());
     g_native_status = "native renderer on " + g_renderer->DeviceName();
-  }
-  if (!g_regs) g_regs = std::make_unique<rex::graphics::RegisterFile>();
-  // Seed with the emulator's GPU registers for what the shadow doesn't hold.
-  if (capturing) g_native_seeded.clear();
-  if (auto* graphics = Graphics()) {
-    std::memcpy(g_regs->values, graphics->register_file()->values, sizeof(g_regs->values));
-    for (uint32_t r = 0x2000; capturing && r < 0x2400; ++r)
-      if (g_regs->values[r] && !InShadow(r) && g_native_seeded.size() < 64)
-        g_native_seeded.push_back(fmt::format("{:04X}={:08X}", r, g_regs->values[r]));
+    StartWorker();
   }
   g_native_readback = capturing && REXCVAR_GET(native_capture_render);
-  g_renderer->SetKeepResolves(REXCVAR_GET(native_keep_resolves));
-  if (REXCVAR_GET(native_debug_frames)) {
-    std::error_code ec;
-    std::filesystem::create_directories(g_out_dir, ec);
-    g_renderer->SetDebugFrames(g_out_dir.string());
+  if (capturing) {
+    WaitForWorker();  // the worker writes the capture's results
+    g_native_resolves.clear();
   }
-  {
-    unsigned first = 0, end = 0;
-    std::sscanf(REXCVAR_GET(native_debug_skip_draws).c_str(), "%u-%u", &first, &end);
-    g_renderer->SetSkipDraws(first, end);
-  }
-  g_renderer->BeginFrame(base, g_native_readback, live);
+  Command c;
+  c.type = Command::Type::kBeginFrame;
+  c.readback = g_native_readback;
+  c.capturing = capturing;
+  c.live = live;
+  Record(c, g, 0);
   g_render_frame = true;
 }
 
@@ -1232,13 +1496,12 @@ void NativeDraw(const Guest& g, uint32_t device, const Parsed& parsed) {
     return;
   }
   const DrawPacket& d = parsed.draws.back();
-  FillRegisters(g, device);
-  auto& regs = *g_regs;
-  regs[0x21FC] = d.initiator;  // VGT_DRAW_INITIATOR
-  regs[0x21FA] = d.index_base;  // VGT_DMA_BASE
-  regs[0x21FB] = d.index_size;  // VGT_DMA_SIZE
-  g_renderer->Draw(regs, g_ucode[g_current_shader[0]], g_ucode[g_current_shader[1]],
-                   {d.initiator, d.index_base, d.index_size});
+  Command c;
+  c.type = Command::Type::kDraw;
+  c.vs = &g_ucode[g_current_shader[0]];
+  c.ps = &g_ucode[g_current_shader[1]];
+  c.draw = {d.initiator, d.index_base, d.index_size};
+  Record(c, g, device);
 }
 
 // The emulator's results of the frame's resolves, for comparison: with the
@@ -1290,63 +1553,40 @@ void WriteEmulatorResolves(uint8_t* base) {
 void EndNativeFrame(const Guest& g, uint32_t front_buffer) {
   if (!g_render_frame) return;
   g_render_frame = false;
-  std::string error;
-  const bool live = g_live.load(std::memory_order_relaxed);
-  tb2::native::PresentRequest present;
-  if (live) {
-    auto* graphics = Graphics();
-    present.presenter = graphics->presenter();
-    // The texture object's fetch constant (at +28) holds CPU addresses.
-    if (front_buffer) present.frontbuffer_base = GpuAddress(g.U32(front_buffer + 32) & ~0xFFFu);
-    if (auto* cp = graphics->command_processor())
-      present.gamma_ramp = reinterpret_cast<const uint32_t*>(cp->gamma_ramp_256_entry_table());
-  }
-  std::vector<tb2::native::ResolvedImage> sync;
-  if (!g_renderer->EndFrame(live ? &present : nullptr,
-                            g_native_readback          ? &g_native_resolves
-                            : REXCVAR_GET(native_sync_frames) ? &sync
-                                                              : nullptr,
-                            &error)) {
-    g_native_status += "; frame failed: " + error;
-    static int logged = 0;
-    if (live && logged++ < 10) REXLOG_ERROR("[native] frame failed: {}", error);
-  }
-  const auto& stats = g_renderer->stats();
-  if (const int interval = REXCVAR_GET(native_stats_interval);
-      live && interval > 0 && g_frame_index % uint32_t(interval) == 0) {
-    REXLOG_INFO(
-        "[native] frame {}: {} draws ({} skipped, {} occlusion queries, {} unknown shaders), {} "
-        "clears, {} resolves, {} "
-        "passes, {} pipelines and {} textures new ({} KB), {} texture failures, {} resolved "
-        "textures overwritten, {} uses of them; GPU {:.2f} ms",
-        g_frame_index, stats.draws, stats.draws_skipped, stats.viz_query_draws,
-        g_native_unknown_shaders, stats.clears,
-        stats.resolves, stats.render_passes, stats.pipelines_created, stats.textures_uploaded,
-        stats.upload_bytes >> 10, stats.texture_failures, stats.resolves_overwritten,
-        stats.textures_from_resolves, stats.gpu_ms_previous);
-    for (const auto& n : stats.notes) REXLOG_INFO("[native]   {}", n);
-    if (!stats.gpu_pass_ms.empty()) {
-      std::string passes;
-      for (float ms : stats.gpu_pass_ms) passes += fmt::format(" {:.2f}", ms);
-      REXLOG_INFO("[native]   GPU ms up to each resolve:{}", passes);
+  Command c;
+  c.type = Command::Type::kEndFrame;
+  c.frame = g_frame_index;
+  c.readback = g_native_readback;
+  c.capturing = Capturing();
+  // The texture object's fetch constant (at +28) holds CPU addresses.
+  if (front_buffer) c.front_buffer = GpuAddress(g.U32(front_buffer + 32) & ~0xFFFu);
+  c.unknown_shaders = g_native_unknown_shaders;
+  c.discontinuities = uint32_t(g_frame.discontinuities);
+  c.segments = uint32_t(g_frame.segments);
+  c.shader_stale = g_frame.shader_object_stale;
+  if (g_live.load(std::memory_order_relaxed))
+    if (auto* cp = Graphics()->command_processor()) {
+      Batch& b = *g_batch;
+      c.has_ramp = true;
+      c.ramp = uint32_t(b.bytes.size());
+      const auto* ramp = reinterpret_cast<const uint8_t*>(cp->gamma_ramp_256_entry_table());
+      b.bytes.insert(b.bytes.end(), ramp, ramp + 256 * 4);
     }
-    if (const uint32_t* ramp = present.gamma_ramp)
-      REXLOG_INFO("[native]   gamma ramp 0 {:08X} 64 {:08X} 128 {:08X} 192 {:08X} 255 {:08X}",
-                  ramp[0], ramp[64], ramp[128], ramp[192], ramp[255]);
+  Record(c, g, 0);
+  FlushCommands();
+  if (Capturing()) {
+    WaitForWorker();
+    if (rex::cvar::GetFlagByName("readback_resolve") == "full") {
+      g_emu_pending = std::move(g_frame_resolves);
+      // WriteFrame numbers this capture next.
+      g_emu_pending_dir = g_out_dir / fmt::format("native_capture_{:03}_native", g_serial + 1);
+    }
+    g_frame_resolves.clear();
+  } else {
+    // At most one frame ahead of the worker.
+    std::unique_lock lock(g_worker.mutex);
+    g_worker.progress.wait(lock, [&] { return g_worker.frames_done + 1 >= c.frame; });
   }
-  if (const int interval = REXCVAR_GET(native_stats_interval);
-      live && interval > 0 && g_frame_index % uint32_t(interval) == 0)
-    REXLOG_INFO("[native]   ring: {} discontinuities, {} segment switches; shader object map "
-                "disagreed with the tracked shaders {} times",
-                g_frame.discontinuities, g_frame.segments, g_frame.shader_object_stale);
-  if (!Capturing()) return;
-  g_native_stats = stats;
-  if (rex::cvar::GetFlagByName("readback_resolve") == "full") {
-    g_emu_pending = std::move(g_frame_resolves);
-    // WriteFrame numbers this capture next.
-    g_emu_pending_dir = g_out_dir / fmt::format("native_capture_{:03}_native", g_serial + 1);
-  }
-  g_frame_resolves.clear();
 }
 
 void WriteNative(std::ofstream& out, const std::filesystem::path& dir) {
@@ -1362,7 +1602,7 @@ void WriteNative(std::ofstream& out, const std::filesystem::path& dir) {
       s.draws - s.draws_skipped, s.draws_skipped, g_native_unknown_shaders, s.clears, s.resolves,
       s.render_passes, s.pipelines_created, s.textures_uploaded, s.upload_bytes,
       s.texture_failures, s.textures_from_resolves, s.signed_texture_bindings, s.vertex_bytes, s.uniform_bytes,
-      g_native_literal_entries);
+      g_native_literal_entries.load());
   out << "registers from the emulator at the frame start (outside the shadow, nonzero):";
   for (auto& r : g_native_seeded) out << ' ' << r;
   out << "\nregisters outside the shadow set by the packets (last values):";
@@ -1530,7 +1770,7 @@ void OnSwapLocked(uint8_t* base, uint32_t front_buffer) {
   g_pending = Parsed{};
   ++g_frame_index;
   g_ring_last = 0;  // set after the swap: it moves to a new ring segment itself
-  BeginNativeFrame(base);
+  BeginNativeFrame(g);
 }
 
 }  // namespace
@@ -1565,6 +1805,12 @@ void NativeCaptureAfterSwap(uint8_t* base) {
   }
 }
 
+void NativeWaitForRenderer() {
+  if (!g_live.load(std::memory_order_relaxed)) return;
+  std::lock_guard lock(g_mutex);
+  WaitForWorker();
+}
+
 void NativeCaptureShutdown() {
   // Before the SDK destroys the Vulkan device: the hooks stop here.
   std::lock_guard lock(g_mutex);
@@ -1572,6 +1818,7 @@ void NativeCaptureShutdown() {
   g_live_failed = true;
   g_state.store(0);
   g_render_frame = false;
+  StopWorker();
   if (g_renderer) g_renderer->WaitIdle();
   g_renderer.reset();
   g_renderer_failed = true;
@@ -1647,28 +1894,31 @@ extern "C" REX_FUNC(sub_823C6450) {
       g_frame.resolve_dest_bases.push_back(GpuAddress(g.U32(dest + 28 + 4) & ~0xFFFu) >> 12);
   }
   if (g_render_frame && ctx.r6.u32) {
-    FillRegisters(g, device);
-    int32_t rect[4];
-    if (const uint32_t r = ctx.r5.u32)
-      for (int i = 0; i < 4; ++i) rect[i] = int32_t(g.U32(r + i * 4));
+    Command c;
+    c.type = Command::Type::kResolve;
+    c.flags = ctx.r4.u32;
+    c.depth = float(ctx.f1.f64);
+    if (const uint32_t r = ctx.r5.u32) {
+      c.has_rect = true;
+      for (int i = 0; i < 4; ++i) c.rect[i] = int32_t(g.U32(r + i * 4));
+    }
     // The texture object's fetch constant holds CPU addresses.
-    uint32_t fetch[6];
-    for (int i = 0; i < 6; ++i) fetch[i] = g.U32(ctx.r6.u32 + 28 + i * 4);
-    fetch[1] = GpuAddress(fetch[1] & ~0xFFFu) | (fetch[1] & 0xFFF);
-    if (fetch[5] & ~0xFFFu) fetch[5] = GpuAddress(fetch[5] & ~0xFFFu) | (fetch[5] & 0xFFF);
-    float clear_color[4] = {};
-    if (const uint32_t c = ctx.r10.u32)
-      for (int i = 0; i < 4; ++i) clear_color[i] = std::bit_cast<float>(g.U32(c + i * 4));
+    for (int i = 0; i < 6; ++i) c.fetch[i] = g.U32(ctx.r6.u32 + 28 + i * 4);
+    c.fetch[1] = GpuAddress(c.fetch[1] & ~0xFFFu) | (c.fetch[1] & 0xFFF);
+    if (c.fetch[5] & ~0xFFFu) c.fetch[5] = GpuAddress(c.fetch[5] & ~0xFFFu) | (c.fetch[5] & 0xFFF);
+    if (const uint32_t cc = ctx.r10.u32)
+      for (int i = 0; i < 4; ++i) c.clear_color[i] = std::bit_cast<float>(g.U32(cc + i * 4));
     if (capturing) {
       EmulatorResolve& er = g_frame_resolves.emplace_back();
-      er.index = g_renderer->stats().resolves;
-      std::memcpy(er.fetch, fetch, sizeof(fetch));
+      er.index = g_native_resolve_count;
+      std::memcpy(er.fetch, c.fetch, sizeof(c.fetch));
     }
-    int32_t point[2];
-    if (const uint32_t p = ctx.r7.u32)
-      for (int i = 0; i < 2; ++i) point[i] = int32_t(g.U32(p + i * 4));
-    g_renderer->Resolve(*g_regs, ctx.r4.u32, ctx.r5.u32 ? rect : nullptr,
-                        ctx.r7.u32 ? point : nullptr, fetch, clear_color, float(ctx.f1.f64), 0);
+    ++g_native_resolve_count;
+    if (const uint32_t p = ctx.r7.u32) {
+      c.has_point = true;
+      for (int i = 0; i < 2; ++i) c.point[i] = int32_t(g.U32(p + i * 4));
+    }
+    Record(c, g, device);
   }
   __imp__sub_823C6450(ctx, base);
   CatchUp(g, RingPos(g, device), 'R');
@@ -1713,9 +1963,14 @@ extern "C" REX_FUNC(sub_823C5C28) {
         g_frame.clears++, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.f1.f64, ctx.r9.u32,
         Targets(g, device)));
   if (g_render_frame) {
-    FillRegisters(g, device);
-    g_renderer->Clear(*g_regs, ctx.r6.u32, ctx.r7.u32, float(ctx.f1.f64), ctx.r9.u32,
-                      BoundSurfaces(g, device));
+    Command c;
+    c.type = Command::Type::kClear;
+    c.flags = ctx.r6.u32;
+    c.color = ctx.r7.u32;
+    c.depth = float(ctx.f1.f64);
+    c.stencil = ctx.r9.u32;
+    c.bound = BoundSurfaces(g, device);
+    Record(c, g, device);
   }
   __imp__sub_823C5C28(ctx, base);
   CatchUp(g, RingPos(g, device), 'C');

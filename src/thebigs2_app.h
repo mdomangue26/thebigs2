@@ -107,9 +107,12 @@ class Thebigs2App : public rex::ReXApp {
     // its 3-tile rendering: about half the GPU command thread's work and ~20%
     // of the GPU's. At 2x and up the resolution scaling already smooths the
     // edges (the image is practically the same), and the Deck needs the
-    // headroom, so it is only kept at 1x on the desktop.
+    // headroom, so it is only kept at 1x on the desktop. The native renderer
+    // draws the tiles once (only the MSAA's GPU cost remains): kept on at
+    // every scale on the desktop.
+    const bool native = rex::cvar::GetFlagByName("native_renderer") == "true";
     if (tb2::SteamDeckProfile() ||
-        std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()) >= 2) {
+        (!native && std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()) >= 2)) {
       set_default("scene_msaa", "false");
     }
   }

@@ -4,7 +4,7 @@ Status: **Phases 0-5 done: the game can run on the native renderer
 (`native_renderer = true`, experimental), with the emulator's GPU drawing
 nothing (`native_detached = true`); frames within 1/255 of the emulator's.
 Restarted 2026-10-20 on [Plume](#rendering-api-plume) (phases 3-5 redone the
-same day); phase 6 (port features) next.** Work happens on the
+same day, phase 6's resolution scaling, render thread and AA options too).** Work happens on the
 `native-renderer` branch; the emulator stays the default. A first renderer
 written straight against Vulkan (phases 3-6, up to resolution scaling, its
 own render thread and AA options) is kept on the branch `native-renderer-vk`
@@ -125,9 +125,9 @@ renderer via `OnCreateImmediateDrawer`).
    post effects stay) with the guest's gamma ramp; the emulator's GPU can stop
    drawing (detached). The Xenos plugin still runs the command stream (fences,
    interrupts, gamma ramp registers); it remains the default renderer.
-6. **Port features** *(in progress on Plume, see below)*. Resolution scaling
-   without EDRAM limits *(done)*; next its own render thread and AA options
-   (both done in the first renderer), then widescreen/ultrawide, frame pacing.
+6. **Port features** *(in progress, see below)*. Resolution scaling without
+   EDRAM limits, the renderer on a thread of its own, AA options *(done, on
+   Plume 2026-10-20)*. The game stays 16:9. Next: persistent geometry.
 
 This is a long project — comparable in size to the renderers written for other
 recompilation ports — and each phase is useful on its own.
@@ -357,6 +357,48 @@ vs `pemu2`): 0.79-1.58/255 (the first renderer: 1.9-2.8). 1x unchanged
 (0.69-1.03/255). 60 fps benchmark at 2x: emulator 48 fps (GPU-bound, FSI path,
 command processor 12.5 ms of work per frame), native detached 60 fps with 15.1
 ms of render thread time.
+
+### The renderer on its own thread
+
+The hooks on the game's render thread only record commands: the draw's
+shaders and packet, a raw copy of the D3D device shadow (11.5 KB: register
+blocks, constants, shader object pointers), the registers packets set outside
+the shadow, and Clear / Resolve / Swap arguments (destination fetch constant,
+rectangles, gamma ramp copy). A "Native Renderer" thread rebuilds the register
+file from them and runs the renderer; batches of 64 commands are handed over
+(`src/native_capture.cpp`, from the first renderer's 0f36190 unchanged).
+
+The worker reads guest memory (vertex / index buffers, textures, literal
+tables) later than the draw call, as the GPU does. The game protects memory
+the GPU may still read with fences, but in detached mode the emulator's
+command processor signals them as soon as it reads the packets. So the game's
+wait-for-GPU poll (`sub_823B3310`, already hooked for its sleep) first waits
+for the worker to drain (`NativeWaitForRenderer`), and at each Swap the render
+thread waits until the worker has finished the previous frame (at most a frame
+of lag). Captures drain the worker at Swap.
+
+60 fps benchmark at the plate (1x, 2026-10-20): render thread 15.4 -> 8.7 ms
+per frame (emulator mode: 6.4), the worker ~9 ms beside it (54% of a core),
+the command processor 1.5 ms. Screenshots against the emulator 1.2-1.5/255 at
+1x, 0.8-1.6/255 at 2x; the rest is animation timing (the frame of lag: batter,
+crowd, pitch meter).
+
+### Anti-aliasing
+
+- **The game's 4x MSAA** (`scene_msaa`): with the native renderer it costs only
+  GPU time (predicated tiling draws the scene once), so the default keeps it on
+  at every scale on the desktop (the Deck default stays off).
+- **`native_msaa`** (2 / 4 / 8): sample count for the render targets the game
+  makes multisampled (its main scene), clamped to what the device supports for
+  color, depth and stencil. Post-processing and the HUD stay single-sampled.
+  Color resolves average any count, depth resolves take sample 0.
+- **`native_fxaa`**: FXAA 3.11 "quality" (`glsl/present_fxaa.frag`) on the
+  presented frame. The present pass then draws the gamma-corrected frame into
+  an image of its own and FXAA from there into the presenter's guest output.
+
+Checked 2026-10-20: 8x MSAA + FXAA at 1x renders every draw with no validation
+messages beyond the SDK's own; edges visibly smoother than 4x, the HUD text a
+little softer (`out/perf/plive8` vs `plive6`).
 
 ### Fixed along the way (first renderer): wrong vertex shaders
 

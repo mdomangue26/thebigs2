@@ -49,6 +49,7 @@ namespace {
 
 #include "glsl/pack_depth_ms_ps.h"
 #include "glsl/pack_depth_ps.h"
+#include "glsl/present_fxaa_ps.h"
 #include "glsl/present_gamma_table_ps.h"
 #include "glsl/present_vs.h"
 #include "glsl/resolve_ms_ps.h"
@@ -633,11 +634,18 @@ struct Renderer::Impl {
   std::unique_ptr<pl::RenderPipelineLayout> resolve_layout;
   std::map<std::tuple<uint32_t, uint32_t, bool>, std::unique_ptr<pl::RenderPipeline>>
       resolve_pipelines;  // (dest format, samples, depth)
-  // Present pass (glsl/present_gamma_table.frag).
-  std::unique_ptr<pl::RenderShader> present_shader;
-  SetPool present_pool;
-  std::unique_ptr<pl::RenderPipelineLayout> present_layout;
-  std::unique_ptr<pl::RenderPipeline> present_pipeline;
+  // Present pass (glsl/present_gamma_table.frag), FXAA (glsl/present_fxaa.frag).
+  std::unique_ptr<pl::RenderShader> present_shader, fxaa_shader;
+  SetPool present_pool, fxaa_pool;
+  std::unique_ptr<pl::RenderPipelineLayout> present_layout, fxaa_layout;
+  std::unique_ptr<pl::RenderPipeline> present_pipeline, fxaa_pipeline;
+  std::unique_ptr<pl::RenderSampler> linear_sampler;
+  bool fxaa = false;
+  Image fxaa_image;  // the gamma-corrected frame FXAA reads
+  // MSAA: sample counts usable for color, depth and stencil (bit n = n samples),
+  // and the count for the game's MSAA targets (0 = the game's).
+  uint32_t msaa_supported = 1;
+  uint32_t msaa_override = 0;
   // Packed depth resolves (glsl/pack_depth*.frag).
   std::unique_ptr<pl::RenderShader> pack_shader, pack_ms_shader;
   SetPool pack_pool;
@@ -750,10 +758,12 @@ Renderer::Impl::~Impl() {
   pack_pipelines.clear();
   pack_layout.reset();
   pack_pool.Clear();
-  present_pipeline.reset();
-  present_layout.reset();
-  present_pool.Clear();
-  present_shader.reset();
+  fxaa_image = Image{};
+  present_pipeline.reset(), fxaa_pipeline.reset();
+  present_layout.reset(), fxaa_layout.reset();
+  present_pool.Clear(), fxaa_pool.Clear();
+  present_shader.reset(), fxaa_shader.reset();
+  linear_sampler.reset();
   pack_shader.reset(), pack_ms_shader.reset();
   resolve_vs_shader.reset(), resolve_shader.reset(), resolve_ms_shader.reset();
   samplers.clear();
@@ -937,6 +947,35 @@ bool Renderer::Impl::Init(const VulkanDevice* sdk_device, std::string* error) {
     desc.renderTargetBlend[0] = pl::RenderBlendDesc::Copy();
     present_pipeline = device->createGraphicsPipeline(desc);
   }
+  fxaa_shader = device->createShader(present_fxaa_ps, sizeof(present_fxaa_ps), "main",
+                                     pl::RenderShaderFormat::SPIRV);
+  fxaa_pool.builder.begin();
+  fxaa_pool.builder.addTexture(0);
+  fxaa_pool.builder.addSampler(1);
+  fxaa_pool.builder.end();
+  layout.begin();
+  layout.addDescriptorSet(fxaa_pool.builder);
+  layout.end();
+  fxaa_layout = layout.create(device);
+  pl::RenderSamplerDesc linear;
+  linear.mipmapMode = pl::RenderMipmapMode::NEAREST;
+  linear.addressU = linear.addressV = linear.addressW = pl::RenderTextureAddressMode::CLAMP;
+  linear_sampler = device->createSampler(linear);
+  if (fxaa_shader && fxaa_layout) {
+    pl::RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = fxaa_layout.get();
+    desc.vertexShader = resolve_vs_shader.get();
+    desc.pixelShader = fxaa_shader.get();
+    desc.renderTargetCount = 1;
+    desc.renderTargetFormat[0] = pl::RenderFormat::R10G10B10A2_UNORM;
+    desc.renderTargetBlend[0] = pl::RenderBlendDesc::Copy();
+    fxaa_pipeline = device->createGraphicsPipeline(desc);
+  }
+  {
+    const auto& props = dev->properties();
+    msaa_supported = props.framebufferColorSampleCounts & props.framebufferDepthSampleCounts &
+                     props.framebufferStencilSampleCounts;
+  }
 
   pack_shader = device->createShader(pack_depth_ps, sizeof(pack_depth_ps), "main",
                                      pl::RenderShaderFormat::SPIRV);
@@ -953,7 +992,8 @@ bool Renderer::Impl::Init(const VulkanDevice* sdk_device, std::string* error) {
   layout.end();
   pack_layout = layout.create(device);
   if (!resolve_vs_shader || !resolve_shader || !resolve_ms_shader || !point_sampler ||
-      !resolve_layout || !pack_shader || !pack_ms_shader || !pack_layout || !present_pipeline)
+      !resolve_layout || !pack_shader || !pack_ms_shader || !pack_layout || !present_pipeline ||
+      !fxaa_pipeline || !linear_sampler)
     return fail("resolve pipeline objects");
   return true;
 }
@@ -976,6 +1016,13 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RegisterFile& regs, int colo
   }
   if (format == VK_FORMAT_UNDEFINED || !surface.surface_pitch) return nullptr;
   key.samples = 1u << std::min(uint32_t(surface.msaa_samples), 2u);  // 1x, 2x, 4x
+  if (key.samples > 1 && msaa_override) {
+    // The game's MSAA targets (its scene) at another sample count: the largest
+    // the device supports up to the setting.
+    key.samples = 1;
+    for (uint32_t n = 2; n <= msaa_override; n <<= 1)
+      if (msaa_supported & n) key.samples = n;
+  }
   auto [it, inserted] = render_targets.try_emplace(key);
   RenderTarget& rt = it->second;
   if (inserted) {
@@ -2014,7 +2061,8 @@ void Renderer::BeginFrame(const uint8_t* memory, bool readback, bool continuous)
   m.uniform_arena = &c.uniform_arena;
   m.staging_arena = &c.staging_arena;
   m.shared_set = c.shared_set;
-  for (SetPool* pool : {&m.constants_pool, &m.resolve_pool, &m.pack_pool, &m.present_pool})
+  for (SetPool* pool :
+       {&m.constants_pool, &m.resolve_pool, &m.pack_pool, &m.present_pool, &m.fxaa_pool})
     pool->used[m.context_index] = 0;
   for (auto& [k, pool] : m.texture_pools) pool.used[m.context_index] = 0;
   m.vertex_copies.clear();
@@ -2285,18 +2333,53 @@ void Renderer::Impl::RecordPresent(VkImage target, bool target_read_before, Text
   set->setSampler(2, point_sampler.get());
 
   pl::RenderCommandList& list = *draw_list;
-  Transition(list, source.image, pl::RenderTextureLayout::SHADER_READ);
-  list.barriers(kAllStages, pl::RenderTextureBarrier(output.get(), pl::RenderTextureLayout::COLOR_WRITE));
-  list.setFramebuffer(framebuffer.get());
-  list.setGraphicsPipelineLayout(present_layout.get());
-  list.setPipeline(present_pipeline.get());
-  list.setGraphicsDescriptorSet(set, 0);
   const pl::RenderViewport viewport(0.0f, 0.0f, float(width), float(height));
   const pl::RenderRect scissor(0, 0, int32_t(width), int32_t(height));
-  list.setViewports(&viewport, 1);
-  list.setScissors(&scissor, 1);
-  list.drawInstanced(3, 1, 0, 0);
-  list.setFramebuffer(nullptr);
+  auto fullscreen = [&](pl::RenderFramebuffer* target, pl::RenderPipelineLayout* layout,
+                        pl::RenderPipeline* pipeline, pl::RenderDescriptorSet* pass_set) {
+    list.setFramebuffer(target);
+    list.setGraphicsPipelineLayout(layout);
+    list.setPipeline(pipeline);
+    list.setGraphicsDescriptorSet(pass_set, 0);
+    list.setViewports(&viewport, 1);
+    list.setScissors(&scissor, 1);
+    list.drawInstanced(3, 1, 0, 0);
+    list.setFramebuffer(nullptr);
+  };
+  Transition(list, source.image, pl::RenderTextureLayout::SHADER_READ);
+  // FXAA: the gamma-corrected frame in an image of our own first, anti-aliased
+  // from there into the output.
+  bool fxaa_pass = false;
+  if (fxaa) {
+    Image& image = fxaa_image;
+    if (image.texture && (image.width != width || image.height != height)) DestroyLater(image);
+    if (!image.texture) {
+      image.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+      image.width = width, image.height = height;
+      const pl::RenderTexture* fxaa_attachment = nullptr;
+      if (CreateImage(image, pl::RenderTextureFlag::RENDER_TARGET)) {
+        fxaa_attachment = image.texture.get();
+        image.framebuffer =
+            device->createFramebuffer(pl::RenderFramebufferDesc(&fxaa_attachment, 1));
+      }
+      if (!image.framebuffer) image = Image{};
+    }
+    if (image.framebuffer) {
+      Transition(list, image, pl::RenderTextureLayout::COLOR_WRITE);
+      fullscreen(image.framebuffer.get(), present_layout.get(), present_pipeline.get(), set);
+      Transition(list, image, pl::RenderTextureLayout::SHADER_READ);
+      fxaa_pass = true;
+    }
+  }
+  list.barriers(kAllStages, pl::RenderTextureBarrier(output.get(), pl::RenderTextureLayout::COLOR_WRITE));
+  if (fxaa_pass) {
+    pl::RenderDescriptorSet* fxaa_set = fxaa_pool.Next(device, context_index);
+    fxaa_set->setTexture(0, fxaa_image.texture.get(), pl::RenderTextureLayout::SHADER_READ);
+    fxaa_set->setSampler(1, linear_sampler.get());
+    fullscreen(framebuffer.get(), fxaa_layout.get(), fxaa_pipeline.get(), fxaa_set);
+  } else {
+    fullscreen(framebuffer.get(), present_layout.get(), present_pipeline.get(), set);
+  }
   // VulkanPresenter::kGuestOutputInternalLayout.
   list.barriers(pl::RenderBarrierStage::GRAPHICS,
                 pl::RenderTextureBarrier(output.get(), pl::RenderTextureLayout::SHADER_READ));
@@ -2413,5 +2496,9 @@ void Renderer::SetSkipDraws(uint32_t first, uint32_t end) {
 uint32_t Renderer::resolution_scale() const { return impl_->scale; }
 
 void Renderer::SetDebugFrames(const std::string& dir) { impl_->debug_dir = dir; }
+
+void Renderer::SetMsaaSamples(uint32_t samples) { impl_->msaa_override = samples; }
+
+void Renderer::SetFxaa(bool fxaa) { impl_->fxaa = fxaa; }
 
 }  // namespace tb2::native

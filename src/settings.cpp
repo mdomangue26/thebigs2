@@ -111,7 +111,7 @@ anisotropic_override = 3
 # needed the frame drawn in 3 tiles; without it the GPU emulation does about
 # half the CPU work and ~20% less GPU work. Not set = automatic: on at 1x,
 # off at 2x and up (the resolution scale already smooths edges) and on the
-# Steam Deck.
+# Steam Deck; with native_renderer on at every scale except on the Deck.
 # scene_msaa = true
 
 # --- Frame rate --------------------------------------------------------------

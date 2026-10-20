@@ -44,7 +44,8 @@ class ShaderLibrary {
   // Default: all optional translator features on (for offline checks); the
   // renderer passes its device's features.
   ShaderLibrary();
-  explicit ShaderLibrary(const SpirvShaderTranslator::Features& features);
+  explicit ShaderLibrary(const SpirvShaderTranslator::Features& features,
+                         uint32_t resolution_scale = 1);
   ~ShaderLibrary();
 
   // The analyzed shader for big-endian microcode, created on first use.

@@ -12,13 +12,15 @@ namespace xg = rex::graphics;
 
 ShaderLibrary::ShaderLibrary() : ShaderLibrary(SpirvShaderTranslator::Features(true)) {}
 
-ShaderLibrary::ShaderLibrary(const SpirvShaderTranslator::Features& features) {
-  // Host render targets: no EDRAM emulation in the shaders, no resolution
-  // scaling inside them.
-  translator_ = std::make_unique<SpirvShaderTranslator>(features,
-                                                        /*native_2x_msaa_with_attachments=*/true,
-                                                        /*native_2x_msaa_no_attachments=*/true,
-                                                        /*edram_fragment_shader_interlock=*/false);
+ShaderLibrary::ShaderLibrary(const SpirvShaderTranslator::Features& features,
+                             uint32_t resolution_scale) {
+  // Host render targets: no EDRAM emulation in the shaders. With resolution
+  // scaling, pixel positions and the coordinates / sizes of scaled (resolved)
+  // textures are converted back to guest pixels inside them.
+  translator_ = std::make_unique<SpirvShaderTranslator>(
+      features, /*native_2x_msaa_with_attachments=*/true,
+      /*native_2x_msaa_no_attachments=*/true, /*edram_fragment_shader_interlock=*/false,
+      resolution_scale, resolution_scale);
 }
 
 ShaderLibrary::~ShaderLibrary() = default;

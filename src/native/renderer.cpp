@@ -17,6 +17,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <unordered_map>
 
@@ -68,7 +69,10 @@ using rex::ui::vulkan::VulkanDevice;
 constexpr uint64_t kVertexArenaSize = 128u << 20;   // vertex + index data
 constexpr uint64_t kUniformArenaSize = 64u << 20;   // constants
 constexpr uint64_t kStagingArenaSize = 128u << 20;  // texture uploads
-constexpr uint32_t kRenderTargetHeight = 2048;      // EDRAM surfaces have no height
+// EDRAM surfaces have no height: render targets get the rows draws and
+// resolves reach (guest pixels, rounded up), up to the guest's 2048.
+constexpr uint32_t kRenderTargetRowsMax = 2048, kRenderTargetRowsStep = 64;
+constexpr uint32_t kResolveStamps = 64;  // GPU timestamps after resolves per frame
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
 constexpr pl::RenderBarrierStages kAllStages = pl::RenderBarrierStage::ALL;
 
@@ -469,6 +473,7 @@ struct Image {
 struct RenderTarget {
   Image image;
   bool depth = false;
+  uint32_t rows = 0;  // guest rows the image holds (its height / resolution scale)
 };
 
 struct RenderTargetKey {
@@ -490,6 +495,7 @@ struct TextureEntry {
   // scene depth as 8_8_8_8 and blends its color grading by the stencil byte).
   bool depth = false;
   Image packed;
+  bool packed_wanted = false;  // sampled as color: packed from the next resolve on
   // Resolved textures hold the render target's components in its order; in
   // guest memory a resolve stores them so that sampling through the
   // destination's fetch swizzle gives that order back.
@@ -582,7 +588,16 @@ struct Renderer::Impl {
     // The presenter's guest output as the frame wrote it.
     std::vector<std::unique_ptr<pl::RenderFramebuffer>> output_framebuffers;
     std::vector<std::unique_ptr<pl::RenderTexture>> outputs;
-    std::unique_ptr<pl::RenderQueryPool> timestamps;  // start, end
+    // Start and end of the frame's commands, then one after each resolve.
+    std::unique_ptr<pl::RenderQueryPool> timestamps;
+    uint32_t resolve_stamps = 0;
+    std::vector<std::unique_ptr<pl::RenderFramebuffer>> garbage_framebuffers;
+    // Debug (SetDebugFrames): a patch of the frame's front buffer, read back
+    // without waiting, and the frame's draw log.
+    std::unique_ptr<pl::RenderBuffer> probe;
+    bool probed = false;
+    uint64_t probe_frame = 0;
+    std::vector<std::string> log;
   };
   FrameContext contexts[kFramesInFlight];
   uint32_t context_index = 0;
@@ -647,6 +662,15 @@ struct Renderer::Impl {
   RendererStats stats;
 
   ~Impl();
+  uint32_t scale = 1;  // resolution scale: host pixels per guest pixel, both axes
+  uint32_t skip_first = 0, skip_end = 0;  // debug: draws [first, end) are not drawn
+  // Debug: per-draw log, dumped for frames whose front buffer patch is much
+  // brighter than usual (with the last normal frame's, to diff them).
+  std::string debug_dir;
+  std::vector<std::string> frame_log, last_normal_log;
+  double probe_average = -1;
+  uint64_t probe_bytes = 0;
+  uint32_t probe_dumps = 0;
   bool Init(const VulkanDevice* device, std::string* error);
   void Note(std::string note) {
     if (stats.notes.size() < 40) stats.notes.push_back(std::move(note));
@@ -669,7 +693,10 @@ struct Renderer::Impl {
                               VkFormat view_format = VK_FORMAT_UNDEFINED);
   void Transition(pl::RenderCommandList& list, Image& image, pl::RenderTextureLayout layout);
 
-  RenderTarget* GetRenderTarget(const RegisterFile& regs, int color_index /* -1 = depth */);
+  // rows: guest rows the caller needs (0 = what it has); grows the target.
+  RenderTarget* GetRenderTarget(const RegisterFile& regs, int color_index /* -1 = depth */,
+                                uint32_t rows = 0);
+  bool GrowRenderTarget(RenderTarget& rt, uint32_t rows);
   pl::RenderFramebuffer* Framebuffer(const std::array<RenderTarget*, 4>& colors, uint32_t count,
                                      RenderTarget* depth);
   bool BeginRendering(const std::array<RenderTarget*, 4>& colors, RenderTarget* depth);
@@ -680,9 +707,10 @@ struct Renderer::Impl {
 
   TextureEntry* GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch);
   // The texture and view a binding samples.
+  // scaled_out: the texture is resolution-scaled (a resolve's).
   std::pair<pl::RenderTexture*, pl::RenderTextureView*> TextureView(
       const RegisterFile& regs, uint32_t fetch_index, xenos::FetchOpDimension dimension,
-      bool is_signed);
+      bool is_signed, bool* scaled_out);
   pl::RenderSampler* Sampler(const RegisterFile& regs, const SpirvShader::SamplerBinding& binding);
 
   SetPool& TexturePool(bool vertex, uint32_t textures, uint32_t samplers);
@@ -809,7 +837,7 @@ bool Renderer::Impl::Init(const VulkanDevice* sdk_device, std::string* error) {
   plume = CreatePlumeDevice(sdk_device, error);
   if (!plume) return false;
   device = plume->device.get();
-  library = std::make_unique<ShaderLibrary>(SpirvShaderTranslator::Features(dev));
+  library = std::make_unique<ShaderLibrary>(SpirvShaderTranslator::Features(dev), scale);
 
   queue = device->createCommandQueue(pl::RenderCommandListType::DIRECT);
   if (!queue) return fail("Plume: no command queue");
@@ -829,7 +857,7 @@ bool Renderer::Impl::Init(const VulkanDevice* sdk_device, std::string* error) {
       return fail("buffer allocation failed");
     c.shared_set = shared_pool.Next(device, i);
     c.shared_set->setBuffer(0, c.vertex_arena.buffer.get());
-    c.timestamps = device->createQueryPool(2);
+    c.timestamps = device->createQueryPool(2 + kResolveStamps);
   }
   {
     VkPhysicalDeviceProperties properties;
@@ -932,7 +960,8 @@ bool Renderer::Impl::Init(const VulkanDevice* sdk_device, std::string* error) {
 
 // --- Render targets --------------------------------------------------------
 
-RenderTarget* Renderer::Impl::GetRenderTarget(const RegisterFile& regs, int color_index) {
+RenderTarget* Renderer::Impl::GetRenderTarget(const RegisterFile& regs, int color_index,
+                                              uint32_t rows) {
   const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
   RenderTargetKey key;
   VkFormat format;
@@ -949,23 +978,67 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RegisterFile& regs, int colo
   key.samples = 1u << std::min(uint32_t(surface.msaa_samples), 2u);  // 1x, 2x, 4x
   auto [it, inserted] = render_targets.try_emplace(key);
   RenderTarget& rt = it->second;
-  if (!inserted) return rt.image.texture ? &rt : nullptr;
-  EndRendering();  // the new target is cleared below
-  rt.depth = color_index < 0;
-  rt.image.format = format;
-  rt.image.width = surface.surface_pitch;
-  rt.image.height = kRenderTargetHeight;
-  rt.image.samples = key.samples;
+  if (inserted) {
+    rt.depth = color_index < 0;
+    rt.image.format = format;
+    rt.image.width = surface.surface_pitch * scale;
+    rt.image.samples = key.samples;
+  } else if (!rt.image.texture && !rt.rows) {
+    return nullptr;  // creation failed before
+  }
+  if (!rt.image.texture || rows > rt.rows) {
+    if (!GrowRenderTarget(rt, std::max<uint32_t>(rows, 720))) {
+      Note(fmt::format("render target {:X} format {:X} pitch {}: texture creation failed", key.base,
+                       key.format, key.pitch));
+      return nullptr;
+    }
+  }
+  return &rt;
+}
+
+// (Re)creates the target's texture with at least this many guest rows,
+// keeping what the old one held.
+bool Renderer::Impl::GrowRenderTarget(RenderTarget& rt, uint32_t rows) {
+  rows = std::min((rows + kRenderTargetRowsStep - 1) / kRenderTargetRowsStep * kRenderTargetRowsStep,
+                  kRenderTargetRowsMax);
+  if (rt.image.texture && rows <= rt.rows) return true;
+  EndRendering();  // clears and copies below happen outside rendering
+  Image old = std::move(rt.image);
+  rt.image = Image{};
+  rt.image.format = old.format;
+  rt.image.width = old.width;
+  rt.image.samples = old.samples;
+  rt.image.height = rows * scale;
   if (!CreateImage(rt.image, rt.depth ? pl::RenderTextureFlag::DEPTH_TARGET
                                       : pl::RenderTextureFlag::RENDER_TARGET)) {
-    Note(fmt::format("render target {:X} format {:X} pitch {}: texture creation failed", key.base,
-                     key.format, key.pitch));
-    return nullptr;
+    rt.image = std::move(old);
+    return rt.image.texture && rt.rows >= rows;
   }
-  // Start cleared (EDRAM contents before the first clear are undefined anyway).
+  // Framebuffers of the old texture go after the frames using them.
+  for (auto it = framebuffers.begin(); it != framebuffers.end();) {
+    if (std::find(it->first.begin(), it->first.end(), &rt) != it->first.end()) {
+      Context().garbage_framebuffers.push_back(std::move(it->second));
+      it = framebuffers.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  // Start cleared (EDRAM contents before the first clear are undefined anyway),
+  // then the old contents on top.
   const float black[4] = {};
   ClearRegion(rt, nullptr, black, 1.0f, 0, true, true);
-  return &rt;
+  if (old.texture) {
+    Transition(*draw_list, old, pl::RenderTextureLayout::COPY_SOURCE);
+    Transition(*draw_list, rt.image, pl::RenderTextureLayout::COPY_DEST);
+    const pl::RenderBox box(0, 0, int32_t(old.width), int32_t(old.height));
+    draw_list->copyTextureRegion(pl::RenderTextureCopyLocation::Subresource(rt.image.texture.get()),
+                                 pl::RenderTextureCopyLocation::Subresource(old.texture.get()), 0, 0,
+                                 0, &box);
+    DestroyLater(old);
+  }
+  if (rt.rows) Note(fmt::format("render target grown from {} to {} rows", rt.rows, rows));
+  rt.rows = rows;
+  return true;
 }
 
 pl::RenderFramebuffer* Renderer::Impl::Framebuffer(const std::array<RenderTarget*, 4>& colors,
@@ -1140,9 +1213,10 @@ TextureEntry* Renderer::Impl::GetTexture(const xenos::xe_gpu_texture_fetch_t& fe
 
 std::pair<pl::RenderTexture*, pl::RenderTextureView*> Renderer::Impl::TextureView(
     const RegisterFile& regs, uint32_t fetch_index, xenos::FetchOpDimension dimension,
-    bool is_signed) {
+    bool is_signed, bool* scaled_out) {
   const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_index);
   TextureEntry* entry = GetTexture(fetch);
+  *scaled_out = entry && entry->from_resolve;
   // A depth resolve read as color: its memory-format words, viewed in the
   // fetch's format, sampled like a texture loaded from that memory.
   VkFormat view_format = VK_FORMAT_UNDEFINED;
@@ -1150,6 +1224,7 @@ std::pair<pl::RenderTexture*, pl::RenderTextureView*> Renderer::Impl::TextureVie
   if (entry && entry->depth && fetch.format != xenos::TextureFormat::k_24_8 &&
       fetch.format != xenos::TextureFormat::k_24_8_FLOAT) {
     view_format = HostTextureFormat(fetch.format);
+    entry->packed_wanted = true;
     if (entry->packed.texture && FormatBytes(view_format) == 4) {
       memory_order = true;
     } else {
@@ -1444,8 +1519,14 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
     Note(fmt::format("draw {}: {}", n, why));
   };
   const auto& props = dev->properties();
+  if (n >= skip_first && n < skip_end) return;
   const auto edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) return skip("copy mode");
+  // Occlusion query draws: count samples, write nothing (the SDK drops them too).
+  if (const auto viz = regs.Get<reg::PA_SC_VIZ_QUERY>(); viz.viz_query_ena && viz.kill_pix_post_hi_z) {
+    ++stats.viz_query_draws;
+    return;
+  }
   if (vs_ucode.empty()) return skip("no vertex shader");
 
   SpirvShader* vs = library->Get(xenos::ShaderType::kVertex, vs_ucode);
@@ -1496,6 +1577,21 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
   SpirvShader::Translation* pst = ps ? library->Translate(*ps, mods.pixel) : nullptr;
   if (!vst || (ps && !pst)) return skip("shader translation failed");
 
+  // Viewport and scissor (UpdateDynamicState), in host pixels.
+  draw_util::ViewportInfo vi;
+  draw_util::GetHostViewportInfo(regs, scale, scale, false, props.maxViewportDimensions[0],
+                                 props.maxViewportDimensions[1], true, depth_control, false, true,
+                                 ps && ps->writes_depth(), vi);
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  // The rows the draw can reach, for the render targets' size.
+  uint32_t rows = scissor.offset[1] + scissor.extent[1];
+  if (vi.xy_extent[1]) rows = std::min(rows, (vi.xy_offset[1] + vi.xy_extent[1] + scale - 1) / scale);
+  for (uint32_t i = 0; i < 2; ++i) {
+    scissor.offset[i] *= scale;
+    scissor.extent[i] *= scale;
+  }
+
   // Render targets.
   const uint32_t color_mask = ps ? draw_util::GetNormalizedColorMask(regs, ps->writes_color_targets())
                                  : 0;
@@ -1503,13 +1599,13 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
   uint32_t color_count = 0;
   for (uint32_t i = 0; i < 4; ++i) {
     if (!((color_mask >> (i * 4)) & 0xF)) continue;
-    colors[i] = GetRenderTarget(regs, int(i));
+    colors[i] = GetRenderTarget(regs, int(i), rows);
     if (colors[i]) color_count = i + 1;
   }
   for (uint32_t i = 0; i < color_count; ++i)
     if (!colors[i]) return skip(fmt::format("color target {} missing below {}", i, color_count));
   RenderTarget* depth = (depth_control.z_enable || depth_control.stencil_enable)
-                            ? GetRenderTarget(regs, -1)
+                            ? GetRenderTarget(regs, -1, rows)
                             : nullptr;
   if (!color_count && !depth) return skip("no render targets");
 
@@ -1590,15 +1686,7 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
   pl::RenderPipeline* pipeline = Pipeline(key);
   if (!pipeline) return skip("no pipeline");
 
-  // Viewport, scissor and the system constants (UpdateDynamicState,
-  // UpdateSystemConstantValues).
-  draw_util::ViewportInfo vi;
-  draw_util::GetHostViewportInfo(regs, 1, 1, false, props.maxViewportDimensions[0],
-                                 props.maxViewportDimensions[1], true, depth_control, false, true,
-                                 ps && ps->writes_depth(), vi);
-  draw_util::Scissor scissor;
-  draw_util::GetScissor(regs, scissor);
-
+  // The system constants (UpdateSystemConstantValues).
   SpirvShaderTranslator::SystemConstants sc;
   std::memset(&sc, 0, sizeof(sc));
   const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
@@ -1651,8 +1739,8 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
     sc.point_vertex_diameter_max = float(minmax.max_size) * (2.0f / 16.0f);
     sc.point_constant_diameter[0] = float(size.width) * (2.0f / 16.0f);
     sc.point_constant_diameter[1] = float(size.height) * (2.0f / 16.0f);
-    sc.point_screen_diameter_to_ndc_radius[0] = 1.0f / std::max(vi.xy_extent[0], 1u);
-    sc.point_screen_diameter_to_ndc_radius[1] = 1.0f / std::max(vi.xy_extent[1], 1u);
+    sc.point_screen_diameter_to_ndc_radius[0] = float(scale) / std::max(vi.xy_extent[0], 1u);
+    sc.point_screen_diameter_to_ndc_radius[1] = float(scale) / std::max(vi.xy_extent[1], 1u);
   }
   const uint32_t used_textures =
       vs->GetUsedTextureMaskAfterTranslation() | (ps ? ps->GetUsedTextureMaskAfterTranslation() : 0);
@@ -1695,6 +1783,32 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
     dword0 = (dword0 & 3) | uint32_t(offset);
   }
 
+  // Texture and sampler descriptors (textures may upload; resolved textures
+  // sampled here were made readable at their resolve). Before the system
+  // constants: they say which textures are resolution-scaled.
+  pl::RenderDescriptorSet* texture_sets[2] = {};
+  uint32_t textures_scaled = 0;
+  for (int stage = 0; stage < 2; ++stage) {
+    const auto& stage_textures = stage ? ps_textures : vs_textures;
+    const auto& stage_samplers = stage ? ps_samplers : vs_samplers;
+    if (stage_textures.empty() && stage_samplers.empty()) continue;
+    pl::RenderDescriptorSet* set =
+        TexturePool(stage == 0, uint32_t(stage_textures.size()), uint32_t(stage_samplers.size()))
+            .Next(device, context_index);
+    texture_sets[stage] = set;
+    for (uint32_t i = 0; i < stage_textures.size(); ++i) {
+      const auto& t = stage_textures[i];
+      stats.signed_texture_bindings += t.is_signed;
+      bool scaled = false;
+      auto [texture, view] =
+          TextureView(regs, t.fetch_constant, t.dimension, t.is_signed, &scaled);
+      set->setTexture(i, texture, pl::RenderTextureLayout::SHADER_READ, view);
+      if (scaled && scale > 1) textures_scaled |= 1u << t.fetch_constant;
+    }
+    for (uint32_t i = 0; i < stage_samplers.size(); ++i)
+      set->setSampler(uint32_t(stage_textures.size()) + i, Sampler(regs, stage_samplers[i]));
+  }
+
   // Constants: one set per draw, its buffers at this draw's offsets.
   const uint64_t ubo_align = props.minUniformBufferOffsetAlignment;
   pl::RenderDescriptorSet* constants_set = constants_pool.Next(device, context_index);
@@ -1724,8 +1838,27 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
     return packed;
   };
   const auto vs_floats = pack_floats(*vs, xg::XE_GPU_REG_SHADER_CONSTANT_000_X);
+  if (!debug_dir.empty()) {
+    std::string line = fmt::format(
+        "{} vs {:016X} ps {:016X} prim {} n {} ib {:08X}/{} vp {},{} {}x{} sc {},{} {}x{} rt {} ds {} "
+        "vsc {:016X}",
+        n, vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0, uint32_t(pair.primitive_type),
+        host.count, draw.index_base, draw.index_size, vi.xy_offset[0], vi.xy_offset[1],
+        vi.xy_extent[0], vi.xy_extent[1], scissor.offset[0], scissor.offset[1], scissor.extent[0],
+        scissor.extent[1], colors[0] ? colors[0]->image.width : 0, depth ? depth->image.width : 0,
+        XXH3_64bits(vs_floats.data(), vs_floats.size() * 4));
+    for (const auto& binding : vs->vertex_bindings()) {
+      const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(binding.fetch_constant);
+      const uint32_t address = vf.address << 2, bytes = vf.size << 2;
+      line += fmt::format(" vb{} {:08X}+{:X}", binding.fetch_constant, address, bytes);
+      if (bytes && uint64_t(address) + bytes <= 0x20000000)
+        line += fmt::format("#{:016X}", XXH3_64bits(memory + 0xA0000000u + address, bytes));
+    }
+    frame_log.push_back(std::move(line));
+  }
   const auto ps_floats =
       ps ? pack_floats(*ps, xg::XE_GPU_REG_SHADER_CONSTANT_256_X) : std::vector<uint32_t>(4);
+  sc.textures_resolution_scaled = textures_scaled;
   if (!upload(SpirvShaderTranslator::kConstantBufferSystem, &sc, sizeof(sc)) ||
       !upload(SpirvShaderTranslator::kConstantBufferFloatVertex, vs_floats.data(),
               vs_floats.size() * 4) ||
@@ -1743,27 +1876,6 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
     if (!dst) return skip("vertex arena full");
     std::memcpy(dst, host.indices.data(), host.indices.size());
     stats.vertex_bytes += host.indices.size();
-  }
-
-  // Texture and sampler descriptors (textures may upload; resolved textures
-  // sampled here were made readable at their resolve).
-  pl::RenderDescriptorSet* texture_sets[2] = {};
-  for (int stage = 0; stage < 2; ++stage) {
-    const auto& stage_textures = stage ? ps_textures : vs_textures;
-    const auto& stage_samplers = stage ? ps_samplers : vs_samplers;
-    if (stage_textures.empty() && stage_samplers.empty()) continue;
-    pl::RenderDescriptorSet* set =
-        TexturePool(stage == 0, uint32_t(stage_textures.size()), uint32_t(stage_samplers.size()))
-            .Next(device, context_index);
-    texture_sets[stage] = set;
-    for (uint32_t i = 0; i < stage_textures.size(); ++i) {
-      const auto& t = stage_textures[i];
-      stats.signed_texture_bindings += t.is_signed;
-      auto [texture, view] = TextureView(regs, t.fetch_constant, t.dimension, t.is_signed);
-      set->setTexture(i, texture, pl::RenderTextureLayout::SHADER_READ, view);
-    }
-    for (uint32_t i = 0; i < stage_samplers.size(); ++i)
-      set->setSampler(uint32_t(stage_textures.size()) + i, Sampler(regs, stage_samplers[i]));
   }
 
   if (!BeginRendering(colors, depth)) return skip("render pass");
@@ -1791,7 +1903,7 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
   bias_constant *= regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
                        ? draw_util::kD3D10PolygonOffsetFactorUnorm24
                        : draw_util::kD3D10PolygonOffsetFactorFloat24;
-  bias_slope *= xenos::kPolygonOffsetScaleSubpixelUnit;
+  bias_slope *= xenos::kPolygonOffsetScaleSubpixelUnit * float(scale);
   list.setDepthBias(bias_constant, 0.0f, bias_slope);
   const float blend_constants[4] = {
       regs.Get<float>(xg::XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(xg::XE_GPU_REG_RB_BLEND_GREEN),
@@ -1824,8 +1936,10 @@ namespace tb2::native {
 Renderer::Renderer() : impl_(std::make_unique<Impl>()) {}
 Renderer::~Renderer() = default;
 
-std::unique_ptr<Renderer> Renderer::Create(const VulkanDevice* device, std::string* error) {
+std::unique_ptr<Renderer> Renderer::Create(const VulkanDevice* device, uint32_t resolution_scale,
+                                           std::string* error) {
   std::unique_ptr<Renderer> r(new Renderer());
+  r->impl_->scale = std::clamp<uint32_t>(resolution_scale, 1, 4);
   if (!r->impl_->Init(device, error)) return nullptr;
   return r;
 }
@@ -1852,9 +1966,44 @@ void Renderer::BeginFrame(const uint8_t* memory, bool readback, bool continuous)
     if (c.timestamps && m.timestamp_period_ns > 0) {
       c.timestamps->queryResults();
       const uint64_t* t = c.timestamps->getResults();
-      m.stats.gpu_ms_previous = float(double(t[1] - t[0]) * m.timestamp_period_ns * 1e-6);
+      auto ms = [&](uint64_t a, uint64_t b) {
+        return float(double(b - a) * m.timestamp_period_ns * 1e-6);
+      };
+      m.stats.gpu_ms_previous = ms(t[0], t[1]);
+      uint64_t last = t[0];
+      for (uint32_t i = 0; i < c.resolve_stamps; ++i) {
+        m.stats.gpu_pass_ms.push_back(ms(last, t[2 + i]));
+        last = t[2 + i];
+      }
+      m.stats.gpu_pass_ms.push_back(ms(last, t[1]));
     }
   }
+  if (c.probed) {
+    c.probed = false;
+    const auto* texels = static_cast<const uint8_t*>(c.probe->map());
+    const size_t count = (texels ? m.probe_bytes : 0) / 4;
+    double sum = 0;
+    for (size_t i = 0; i < count; ++i)
+      sum += texels[i * 4] * 0.3 + texels[i * 4 + 1] * 0.59 + texels[i * 4 + 2] * 0.11;
+    if (texels) c.probe->unmap();
+    const double mean = count ? sum / double(count) : 0;
+    if (c.log.size() < 1000) {
+      // not gameplay: ignored
+    } else if (m.probe_average > 5 && mean > m.probe_average + 12 && m.probe_dumps < 200) {
+      ++m.probe_dumps;
+      std::ofstream out(m.debug_dir + fmt::format("/native_bright_{}.txt", c.probe_frame));
+      out << fmt::format("# frame {} patch mean {:.1f}, usual {:.1f}\n", c.probe_frame, mean,
+                         m.probe_average);
+      for (const auto& l : c.log) out << l << '\n';
+      std::ofstream normal(m.debug_dir + fmt::format("/native_normal_{}.txt", c.probe_frame));
+      for (const auto& l : m.last_normal_log) normal << l << '\n';
+    } else if (mean <= (m.probe_average < 0 ? 1e9 : m.probe_average + 12)) {
+      m.probe_average = m.probe_average < 0 ? mean : m.probe_average * 0.9 + mean * 0.1;
+      m.last_normal_log = std::move(c.log);
+    }
+    c.log.clear();
+  }
+  c.garbage_framebuffers.clear();
   c.garbage.clear();
   c.output_framebuffers.clear();
   c.outputs.clear();
@@ -1877,7 +2026,8 @@ void Renderer::BeginFrame(const uint8_t* memory, bool readback, bool continuous)
   m.upload_list->begin();
   m.draw_list->begin();
   if (c.timestamps && m.timestamp_period_ns > 0) {
-    m.upload_list->resetQueryPool(c.timestamps.get(), 0, 2);
+    m.upload_list->resetQueryPool(c.timestamps.get(), 0, 2 + kResolveStamps);
+    c.resolve_stamps = 0;
     m.upload_list->writeTimestamp(c.timestamps.get(), 0);
   }
   m.rendering = false;
@@ -1944,19 +2094,23 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
   ResolvedImage result;
   result.index = index;
   result.dest_base = dest.base_address << 12;
-  RenderTarget* rt = m.GetRenderTarget(regs, depth ? -1 : int(flags & 3));
-
   // Source rectangle, and where it goes in the destination (predicated tiling
-  // resolves each tile to its place).
+  // resolves each tile to its place); then in host pixels. The destination
+  // texture is resolution-scaled too: tw x th.
   int32_t x0 = 0, y0 = 0, x1 = int32_t(dw), y1 = int32_t(dh);
   if (rect) x0 = rect[0], y0 = rect[1], x1 = rect[2], y1 = rect[3];
-  const int32_t px = dest_point ? std::max(dest_point[0], 0) : 0;
-  const int32_t py = dest_point ? std::max(dest_point[1], 0) : 0;
+  RenderTarget* rt =
+      m.GetRenderTarget(regs, depth ? -1 : int(flags & 3), uint32_t(std::clamp(y1, 0, 2048)));
+  const int32_t s = int32_t(m.scale);
+  x0 *= s, y0 *= s, x1 *= s, y1 *= s;
+  const uint32_t tw = dw * m.scale, th = dh * m.scale;
+  const int32_t px = dest_point ? std::max(dest_point[0], 0) * s : 0;
+  const int32_t py = dest_point ? std::max(dest_point[1], 0) * s : 0;
   if (rt) {
     x0 = std::clamp(x0, 0, int32_t(rt->image.width));
     y0 = std::clamp(y0, 0, int32_t(rt->image.height));
-    x1 = std::clamp(x1, x0, std::min(int32_t(rt->image.width), x0 + int32_t(dw) - px));
-    y1 = std::clamp(y1, y0, std::min(int32_t(rt->image.height), y0 + int32_t(dh) - py));
+    x1 = std::clamp(x1, x0, std::min(int32_t(rt->image.width), x0 + int32_t(tw) - px));
+    y1 = std::clamp(y1, y0, std::min(int32_t(rt->image.height), y0 + int32_t(th) - py));
   }
   const uint32_t w = rt ? uint32_t(std::max(x1 - x0, 0)) : 0;
   const uint32_t h = rt ? uint32_t(std::max(y1 - y0, 0)) : 0;
@@ -1972,11 +2126,11 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
   } else {
     entry = &m.resolved[dest.base_address];
     Image& image = entry->image;
-    if (image.texture && (image.format != dest_format || image.width != dw || image.height != dh))
+    if (image.texture && (image.format != dest_format || image.width != tw || image.height != th))
       m.DestroyLater(image);
     if (!image.texture) {
       image.format = dest_format;
-      image.width = dw, image.height = dh;
+      image.width = tw, image.height = th;
       const pl::RenderTexture* attachment = nullptr;
       if (m.CreateImage(image, pl::RenderTextureFlag::RENDER_TARGET)) {
         attachment = image.texture.get();
@@ -2007,12 +2161,12 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
     // Depth resolves also keep the packed memory words.
     entry->depth = depth;
     Image& packed = entry->packed;
-    if (packed.texture && (!depth || packed.width != dw || packed.height != dh))
+    if (packed.texture && (!depth || packed.width != tw || packed.height != th))
       m.DestroyLater(packed);
-    if (depth && !packed.texture) {
+    if (depth && entry->packed_wanted && !packed.texture) {
       packed.format = VK_FORMAT_R32_UINT;
       packed.mutable_format = true;
-      packed.width = dw, packed.height = dh;
+      packed.width = tw, packed.height = th;
       const pl::RenderTexture* attachment = nullptr;
       if (m.CreateImage(packed, pl::RenderTextureFlag::RENDER_TARGET)) {
         attachment = packed.texture.get();
@@ -2056,15 +2210,15 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
     rb.format = image.format;
     if (m.readback && FormatBytes(rb.format)) {
       rb.buffer = m.device->createBuffer(
-          pl::RenderBufferDesc::ReadbackBuffer(uint64_t(dw) * dh * FormatBytes(rb.format)));
+          pl::RenderBufferDesc::ReadbackBuffer(uint64_t(tw) * th * FormatBytes(rb.format)));
     }
     if (rb.buffer) {
       m.Transition(list, image, pl::RenderTextureLayout::COPY_SOURCE);
       list.copyTextureRegion(
           pl::RenderTextureCopyLocation::PlacedFootprint(rb.buffer.get(), ToRenderFormat(rb.format),
-                                                         dw, dh, 1, dw),
+                                                         tw, th, 1, tw),
           pl::RenderTextureCopyLocation::Subresource(image.texture.get()));
-      result.width = dw, result.height = dh;
+      result.width = tw, result.height = th;
       if (depth) result.note = "depth";
       rb.result = result;
       m.readbacks.push_back(std::move(rb));
@@ -2077,6 +2231,9 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
     rb.result = result;
     m.readbacks.push_back(std::move(rb));
   }
+  if (Impl::FrameContext& c = m.Context();
+      c.timestamps && m.timestamp_period_ns > 0 && c.resolve_stamps < kResolveStamps)
+    m.draw_list->writeTimestamp(c.timestamps.get(), 2 + c.resolve_stamps++);
   // Clears after the copy (D3DRESOLVE_CLEARRENDERTARGET / CLEARDEPTHSTENCIL),
   // of the resolved rectangle only: with predicated tiling every tile is
   // resolved and cleared on its own, while the native renderer has drawn all of
@@ -2173,6 +2330,25 @@ bool Renderer::EndFrame(const PresentRequest* present, std::vector<ResolvedImage
       m.Note(fmt::format("present: front buffer {:08X} was not resolved", present->frontbuffer_base));
     } else {
       TextureEntry& source = it->second;
+      // Debug: the patch where the giant ball showed, (800,60)-(1150,300).
+      const uint32_t px = 800 * m.scale, py = 60 * m.scale, pw = 350 * m.scale, ph = 240 * m.scale;
+      if (!m.debug_dir.empty() && source.image.format == VK_FORMAT_R8G8B8A8_UNORM &&
+          source.image.width >= px + pw && source.image.height >= py + ph) {
+        m.probe_bytes = uint64_t(pw) * ph * 4;
+        if (!c.probe) c.probe = m.device->createBuffer(pl::RenderBufferDesc::ReadbackBuffer(m.probe_bytes));
+        if (c.probe) {
+          m.Transition(*m.draw_list, source.image, pl::RenderTextureLayout::COPY_SOURCE);
+          const pl::RenderBox box(int32_t(px), int32_t(py), int32_t(px + pw), int32_t(py + ph));
+          m.draw_list->copyTextureRegion(
+              pl::RenderTextureCopyLocation::PlacedFootprint(c.probe.get(),
+                                                             pl::RenderFormat::R8G8B8A8_UNORM, pw,
+                                                             ph, 1, pw),
+              pl::RenderTextureCopyLocation::Subresource(source.image.texture.get()), 0, 0, 0,
+              &box);
+          c.probed = true;
+          c.probe_frame = m.frame;
+        }
+      }
       present->presenter->RefreshGuestOutput(
           source.image.width, source.image.height, present->aspect_x, present->aspect_y,
           [&](rex::ui::Presenter::GuestOutputRefreshContext& context) -> bool {
@@ -2188,6 +2364,8 @@ bool Renderer::EndFrame(const PresentRequest* present, std::vector<ResolvedImage
     }
   }
   if (!submitted) submit();
+  c.log = std::move(m.frame_log);
+  m.frame_log.clear();
   if (error) error->clear();
   if (!resolves) {
     m.readbacks.clear();
@@ -2227,5 +2405,13 @@ void Renderer::WaitIdle() {
 }
 
 void Renderer::SetKeepResolves(bool keep) { impl_->keep_resolves = keep; }
+
+void Renderer::SetSkipDraws(uint32_t first, uint32_t end) {
+  impl_->skip_first = first, impl_->skip_end = end;
+}
+
+uint32_t Renderer::resolution_scale() const { return impl_->scale; }
+
+void Renderer::SetDebugFrames(const std::string& dir) { impl_->debug_dir = dir; }
 
 }  // namespace tb2::native

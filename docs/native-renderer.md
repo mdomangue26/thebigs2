@@ -125,8 +125,9 @@ renderer via `OnCreateImmediateDrawer`).
    post effects stay) with the guest's gamma ramp; the emulator's GPU can stop
    drawing (detached). The Xenos plugin still runs the command stream (fences,
    interrupts, gamma ramp registers); it remains the default renderer.
-6. **Port features**. Widescreen/ultrawide, AA options, resolution scaling
-   without EDRAM limits, frame pacing.
+6. **Port features** *(in progress on Plume, see below)*. Resolution scaling
+   without EDRAM limits *(done)*; next its own render thread and AA options
+   (both done in the first renderer), then widescreen/ultrawide, frame pacing.
 
 This is a long project — comparable in size to the renderers written for other
 recompilation ports — and each phase is useful on its own.
@@ -322,6 +323,57 @@ The native work runs on the render thread (draw recording, index conversion,
 vertex copies, driver), so it adds to the game's frame time instead of running
 beside it like the command processor did. Next (phase 6 of the first
 renderer): record on a thread of its own, resolution scaling, AA options.
+
+## Phase 6 on Plume: port features
+
+Ported 2026-10-20 from the first renderer's phase 6 (commits 747034d and
+0f36190 on `native-renderer-vk`; capture-side code and the shader library
+change came over unchanged).
+
+### Resolution scaling
+
+The native renderer follows `resolution_scale` (1-4): render targets are
+`pitch x scale` wide, resolves draw scaled rectangles into scaled textures, and
+the front buffer goes to the presenter at its scaled size. Draws get what the
+SDK's Vulkan backend applies: `GetHostViewportInfo` with the scale, scaled
+scissor, depth bias slope and point sizes, and the shader library's translator
+is created with the scale (pixel positions and the coordinates / sizes of
+resolution-scaled textures are converted back to guest pixels in the shaders,
+for textures flagged in `textures_resolution_scaled` - every resolved texture).
+Texture descriptors are set up before the system constants, which carry those
+flags.
+
+Render targets don't get 2048 rows (EDRAM surfaces have no height): each draw
+asks for the rows its scissor and viewport reach, each resolve for its
+rectangle, and a target grows (new texture, old contents copied, framebuffers
+using it retired) when asked for more. At 2x the 4x MSAA scene would otherwise
+need ~670 MB. Depth resolves are packed with stencil only once something has
+sampled them as color. Occlusion query draws (`PA_SC_VIZ_QUERY`) are dropped,
+as the SDK does. GPU time per resolve is in the stats (`native_stats_interval`).
+
+Results (2026-10-20, RTX 4060, Fenway at-bat at 2x, `scene_msaa` off as the 2x
+default; screenshots against the emulator's own 2x FSI frames, `out/perf/plive5`
+vs `pemu2`): 0.79-1.58/255 (the first renderer: 1.9-2.8). 1x unchanged
+(0.69-1.03/255). 60 fps benchmark at 2x: emulator 48 fps (GPU-bound, FSI path,
+command processor 12.5 ms of work per frame), native detached 60 fps with 15.1
+ms of render thread time.
+
+### Fixed along the way (first renderer): wrong vertex shaders
+
+Frames without predicated tiling (`scene_msaa` off: 1x without MSAA, every 2x
+frame) sometimes drew a few meshes with another draw's vertex shader - a giant
+baseball across the screen in about half the frames. The current shaders were
+tracked from the microcode loads parsed out of the ring, and some loads happen
+where the parser doesn't look; which frames lost one depended on timing. Now a
+draw whose flush has no load uses the shader D3D has bound, through the
+(shader object, vertex declaration) -> microcode map learned from earlier
+loads (`src/native_capture.cpp`).
+
+Found with `native_debug_frames` (per-draw logs of frames whose front buffer
+has an unusually bright patch, next to the last normal frame's, written to the
+captures folder). Other debug settings: `native_sync_frames` (no frames in
+flight), `native_debug_skip_draws=FIRST-END` (bisecting - unreliable for
+intermittent problems).
 
 ## Phase 2: resource conversion (`src/native/`)
 

@@ -60,9 +60,11 @@ struct RendererStats {
   uint32_t draws = 0, draws_skipped = 0, clears = 0, resolves = 0;
   uint32_t pipelines_created = 0, textures_uploaded = 0, texture_failures = 0;
   uint32_t textures_from_resolves = 0, render_passes = 0, signed_texture_bindings = 0;
+  uint32_t viz_query_draws = 0;  // occlusion query draws (not drawn)
   uint32_t resolves_overwritten = 0;  // resolved textures dropped: the CPU wrote their memory
   uint64_t vertex_bytes = 0, uniform_bytes = 0, upload_bytes = 0;
   float gpu_ms_previous = 0;  // GPU time of the frame this one's resources were last used by
+  std::vector<float> gpu_pass_ms;  // that frame's GPU time up to each resolve, and after the last
   std::vector<std::string> notes;  // first few problems (skipped draws, ...)
 };
 
@@ -77,9 +79,10 @@ struct PresentRequest {
 class Renderer {
  public:
   // On the SDK's Vulkan device, which must outlive the renderer. Null with a
-  // reason if it isn't usable.
+  // reason if it isn't usable. resolution_scale: render targets and resolves
+  // at that many host pixels per guest pixel on each axis (1-4).
   static std::unique_ptr<Renderer> Create(const rex::ui::vulkan::VulkanDevice* device,
-                                          std::string* error);
+                                          uint32_t resolution_scale, std::string* error);
   ~Renderer();
 
   // memory: guest memory base (physical address p at memory + 0xA0000000 + p).
@@ -123,9 +126,15 @@ class Renderer {
   // Keep resolved textures even when their guest memory changes (comparisons
   // with readback_resolve, where the emulator writes its resolves there).
   void SetKeepResolves(bool keep);
+  // Debug: don't draw the frame's draws [first, end).
+  void SetSkipDraws(uint32_t first, uint32_t end);
+  // Debug: log every draw; dump the log of frames whose front buffer has an
+  // unusually bright patch (and of the last normal frame) to dir.
+  void SetDebugFrames(const std::string& dir);
 
   const RendererStats& stats() const;
   std::string DeviceName() const;
+  uint32_t resolution_scale() const;
 
  private:
   Renderer();

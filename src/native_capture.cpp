@@ -49,6 +49,7 @@
 #include <chrono>
 #include <atomic>
 #include <set>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -108,6 +109,14 @@ REXCVAR_DEFINE_BOOL(native_keep_resolves, false, "The Bigs 2/Debug",
 REXCVAR_DEFINE_BOOL(native_page_watch, true, "The Bigs 2/Debug",
                     "Native renderer: track CPU writes to guest memory instead of hashing every "
                     "texture every frame");
+REXCVAR_DEFINE_BOOL(native_sync_frames, false, "The Bigs 2/Debug",
+                    "Native renderer: wait for each frame's GPU work at its end (no frames in "
+                    "flight)");
+REXCVAR_DEFINE_STRING(native_debug_skip_draws, "", "The Bigs 2/Debug",
+                      "Native renderer: FIRST-END, draws of each frame not drawn (bisecting)");
+REXCVAR_DEFINE_BOOL(native_debug_frames, false, "The Bigs 2/Debug",
+                    "Native renderer: dump the draw logs of frames with an unusually bright "
+                    "patch next to the captures");
 REXCVAR_DEFINE_INT32(native_stats_interval, 0, "The Bigs 2/Native renderer",
                      "Log the native renderer's statistics every this many frames (0 = never)");
 
@@ -326,7 +335,8 @@ void ParsePm4(const Guest& g, uint32_t p, uint32_t end, Parsed& out) {
       LogPacket(g, p, size, out);
     } else if (type == 3 && Capturing()) {  // replays and predication: worth seeing
       const uint32_t op = (h >> 8) & 0x7F;
-      if (op == 0x3F || op == 0x37 || (op >= 0x60 && op <= 0x65)) LogPacket(g, p, size, out);
+      if (op == 0x3F || op == 0x37 || op == 0x3C || (op >= 0x60 && op <= 0x65))
+        LogPacket(g, p, size, out);
     }
     p += size * 4;
   }
@@ -1016,15 +1026,19 @@ void TrackDrawShaders(const Guest& g, uint32_t device, const Parsed& parsed, uin
       }
     }
   }
+  // Without a load in this draw's flush, the shader D3D has bound (object +
+  // declaration) is the one it loaded for that combination before: the ring
+  // can load shaders where the parser doesn't look (some frames' tracked
+  // vertex shader was another draw's - giant meshes), so the objects win.
   auto from_object = [&](int type, uint64_t found) {
     if (loaded_type[type] || !found) return;
     uint64_t& current = g_current_shader[type];
     if (!current) {
-      current = found;
       ++f.shader_by_object;
     } else if (current != found) {
       ++f.shader_object_stale;
     }
+    current = found;
   };
   auto vs_it = g_vs_by_object.find({vs_object, decl});
   from_object(0, vs_it != g_vs_by_object.end() ? vs_it->second : 0);
@@ -1126,6 +1140,11 @@ uint32_t BoundSurfaces(const Guest& g, uint32_t device) {
   return bound;
 }
 
+// The SDK's resolution_scale setting, which the native renderer follows.
+uint32_t ResolutionScale() {
+  return uint32_t(std::clamp(rex::cvar::Query<int32_t>("resolution_scale"), 1, 4));
+}
+
 rex::graphics::GraphicsSystem* Graphics() {
   return static_cast<rex::graphics::GraphicsSystem*>(
       rex::system::kernel_state()->emulator()->graphics_system());
@@ -1139,7 +1158,8 @@ void StartLive() {
   auto* provider =
       graphics ? dynamic_cast<rex::ui::vulkan::VulkanProvider*>(graphics->provider()) : nullptr;
   std::string error = "the GPU backend isn't Vulkan";
-  if (provider) g_renderer = tb2::native::Renderer::Create(provider->vulkan_device(), &error);
+  if (provider)
+    g_renderer = tb2::native::Renderer::Create(provider->vulkan_device(), ResolutionScale(), &error);
   if (!provider || !g_renderer) {
     g_live_failed = true;
     REXLOG_ERROR("[native] native renderer unavailable, the emulator keeps rendering: {}", error);
@@ -1148,7 +1168,8 @@ void StartLive() {
   g_renderer_failed = false;
   if (REXCVAR_GET(native_page_watch))
     g_renderer->WatchGuestMemory(rex::system::kernel_state()->memory());
-  g_native_status = "native renderer (live) on " + g_renderer->DeviceName();
+  g_native_status = fmt::format("native renderer (live) on {} at {}x", g_renderer->DeviceName(),
+                                g_renderer->resolution_scale());
   rex::cvar::SetFlagByName("present_guest_swaps", "false");
   if (REXCVAR_GET(native_detached)) rex::cvar::SetFlagByName("gpu_skip_draws", "true");
   REXLOG_INFO("[native] {}{}", g_native_status,
@@ -1168,7 +1189,7 @@ void BeginNativeFrame(uint8_t* base) {
     auto* graphics = rex::system::kernel_state()->emulator()->graphics_system();
     auto* provider =
         graphics ? dynamic_cast<rex::ui::vulkan::VulkanProvider*>(graphics->provider()) : nullptr;
-    if (provider) g_renderer = tb2::native::Renderer::Create(provider->vulkan_device(), &error);
+    if (provider) g_renderer = tb2::native::Renderer::Create(provider->vulkan_device(), ResolutionScale(), &error);
     if (!g_renderer) {
       g_renderer_failed = true;
       g_native_status = "native renderer unavailable: " + error;
@@ -1190,6 +1211,16 @@ void BeginNativeFrame(uint8_t* base) {
   }
   g_native_readback = capturing && REXCVAR_GET(native_capture_render);
   g_renderer->SetKeepResolves(REXCVAR_GET(native_keep_resolves));
+  if (REXCVAR_GET(native_debug_frames)) {
+    std::error_code ec;
+    std::filesystem::create_directories(g_out_dir, ec);
+    g_renderer->SetDebugFrames(g_out_dir.string());
+  }
+  {
+    unsigned first = 0, end = 0;
+    std::sscanf(REXCVAR_GET(native_debug_skip_draws).c_str(), "%u-%u", &first, &end);
+    g_renderer->SetSkipDraws(first, end);
+  }
   g_renderer->BeginFrame(base, g_native_readback, live);
   g_render_frame = true;
 }
@@ -1270,8 +1301,12 @@ void EndNativeFrame(const Guest& g, uint32_t front_buffer) {
     if (auto* cp = graphics->command_processor())
       present.gamma_ramp = reinterpret_cast<const uint32_t*>(cp->gamma_ramp_256_entry_table());
   }
+  std::vector<tb2::native::ResolvedImage> sync;
   if (!g_renderer->EndFrame(live ? &present : nullptr,
-                            g_native_readback ? &g_native_resolves : nullptr, &error)) {
+                            g_native_readback          ? &g_native_resolves
+                            : REXCVAR_GET(native_sync_frames) ? &sync
+                                                              : nullptr,
+                            &error)) {
     g_native_status += "; frame failed: " + error;
     static int logged = 0;
     if (live && logged++ < 10) REXLOG_ERROR("[native] frame failed: {}", error);
@@ -1280,18 +1315,30 @@ void EndNativeFrame(const Guest& g, uint32_t front_buffer) {
   if (const int interval = REXCVAR_GET(native_stats_interval);
       live && interval > 0 && g_frame_index % uint32_t(interval) == 0) {
     REXLOG_INFO(
-        "[native] frame {}: {} draws ({} skipped, {} unknown shaders), {} clears, {} resolves, {} "
+        "[native] frame {}: {} draws ({} skipped, {} occlusion queries, {} unknown shaders), {} "
+        "clears, {} resolves, {} "
         "passes, {} pipelines and {} textures new ({} KB), {} texture failures, {} resolved "
         "textures overwritten, {} uses of them; GPU {:.2f} ms",
-        g_frame_index, stats.draws, stats.draws_skipped, g_native_unknown_shaders, stats.clears,
+        g_frame_index, stats.draws, stats.draws_skipped, stats.viz_query_draws,
+        g_native_unknown_shaders, stats.clears,
         stats.resolves, stats.render_passes, stats.pipelines_created, stats.textures_uploaded,
         stats.upload_bytes >> 10, stats.texture_failures, stats.resolves_overwritten,
         stats.textures_from_resolves, stats.gpu_ms_previous);
     for (const auto& n : stats.notes) REXLOG_INFO("[native]   {}", n);
+    if (!stats.gpu_pass_ms.empty()) {
+      std::string passes;
+      for (float ms : stats.gpu_pass_ms) passes += fmt::format(" {:.2f}", ms);
+      REXLOG_INFO("[native]   GPU ms up to each resolve:{}", passes);
+    }
     if (const uint32_t* ramp = present.gamma_ramp)
       REXLOG_INFO("[native]   gamma ramp 0 {:08X} 64 {:08X} 128 {:08X} 192 {:08X} 255 {:08X}",
                   ramp[0], ramp[64], ramp[128], ramp[192], ramp[255]);
   }
+  if (const int interval = REXCVAR_GET(native_stats_interval);
+      live && interval > 0 && g_frame_index % uint32_t(interval) == 0)
+    REXLOG_INFO("[native]   ring: {} discontinuities, {} segment switches; shader object map "
+                "disagreed with the tracked shaders {} times",
+                g_frame.discontinuities, g_frame.segments, g_frame.shader_object_stale);
   if (!Capturing()) return;
   g_native_stats = stats;
   if (rex::cvar::GetFlagByName("readback_resolve") == "full") {

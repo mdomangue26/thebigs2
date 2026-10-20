@@ -390,13 +390,13 @@ SDK commit a52de02 (see *SDK fixes* in section 1); with an unpatched SDK use
 `src/native/`) from the game's Direct3D calls, instead of emulating the Xbox
 360 GPU; the emulator's frames are no longer shown. `native_detached = true`
 also stops the GPU emulation from drawing (it still runs the command stream
-for synchronization). Frames match the emulator's to about 1/255. Limits for
-now: it always renders at 720p (`resolution_scale` doesn't apply; the image is
-upscaled for the window), so use `resolution_scale = 1` with it to keep the
-game's 4x MSAA (`scene_msaa` is off at 2x), and it works only with the Vulkan
-backend. Its work runs on the game's render thread: at the plate that is about
-the same CPU time per frame as the emulator's GPU thread (60 fps both ways on
-a Ryzen 5 5600). Development notes: [docs/native-renderer.md](docs/native-renderer.md).
+for synchronization). Frames match the emulator's to about 1/255. It follows
+`resolution_scale` (1x-4x, without the emulator's EDRAM limits); at 2x it holds
+60 fps where the emulator's 2x path is GPU-bound at 48-55 (RTX 4060, with
+`frame_rate = 60`). It works only with the Vulkan backend, and its work runs on
+the game's render thread: at the plate that is about the same CPU time per
+frame as the emulator's GPU thread. Development notes:
+[docs/native-renderer.md](docs/native-renderer.md).
 
 ### Quitting and hotkeys
 

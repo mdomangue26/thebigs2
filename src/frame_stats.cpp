@@ -176,7 +176,7 @@ rex::ui::FrameStats GuestFrameStats() {
 extern "C" REX_FUNC(__imp__sub_823BA340);
 extern "C" REX_FUNC(sub_823BA340) {
   TB2_TRACE_HOOKED(0x823BA340);
-  tb2::NativeCaptureOnSwap(base);
+  tb2::NativeCaptureOnSwap(base, ctx.r4.u32);
   OnSwap();
   __imp__sub_823BA340(ctx, base);
   tb2::NativeCaptureAfterSwap(base);

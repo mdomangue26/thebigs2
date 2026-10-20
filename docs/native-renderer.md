@@ -1,14 +1,14 @@
 # Native Vulkan renderer — plan and findings
 
-Status: **Phases 0 (mapping) and 1 (shadow capture) done; phase 2 (resource
-conversion) done except the pipeline cache, which needs the Vulkan device of
-phase 3. Restarted 2026-10-20 on [Plume](#rendering-api-plume); phases 3
-and 4 redone on it the same day (captured frames drawn natively, resolve by
-resolve as close to the emulator as the first renderer got); phase 5 next.** Work happens on the
-`native-renderer` branch. A first renderer written straight against Vulkan
-(phases 3-6, menus to full frames, live and detached mode, resolution scaling,
-AA options) is kept on the branch `native-renderer-vk` for reference. The game still renders through the SDK's Xenos GPU
-emulator; nothing here changes that yet. Findings: [d3d-map.md](d3d-map.md).
+Status: **Phases 0-5 done: the game can run on the native renderer
+(`native_renderer = true`, experimental), with the emulator's GPU drawing
+nothing (`native_detached = true`); frames within 1/255 of the emulator's.
+Restarted 2026-10-20 on [Plume](#rendering-api-plume) (phases 3-5 redone the
+same day); phase 6 (port features) next.** Work happens on the
+`native-renderer` branch; the emulator stays the default. A first renderer
+written straight against Vulkan (phases 3-6, up to resolution scaling, its
+own render thread and AA options) is kept on the branch `native-renderer-vk`
+for reference. Findings: [d3d-map.md](d3d-map.md).
 
 ## Why
 
@@ -120,8 +120,11 @@ renderer via `OnCreateImmediateDrawer`).
 4. **Full frame** *(done, on Plume 2026-10-20, see below)*. Render targets and
    resolves without EDRAM, depth, MSAA, post-processing, shadows, crowd, Bink
    movie textures, checked resolve by resolve against the emulator.
-5. **Switch over**. Run without the Xenos plugin (detached mode) with our own
-   swapchain and overlays; keep the emulator as a fallback setting.
+5. **Switch over** *(done, on Plume 2026-10-20, see below)*. Live rendering
+   every frame, presented through the SDK presenter (its pacing, overlays and
+   post effects stay) with the guest's gamma ramp; the emulator's GPU can stop
+   drawing (detached). The Xenos plugin still runs the command stream (fences,
+   interrupts, gamma ramp registers); it remains the default renderer.
 6. **Port features**. Widescreen/ultrawide, AA options, resolution scaling
    without EDRAM limits, frame pacing.
 
@@ -262,6 +265,63 @@ Known differences:
   frames.
 - Not handled: memexport, line polygon mode (drawn filled, noted), gaps
   between bound color targets (skipped, noted). None occur in the captures.
+
+## Phase 5 on Plume: switch over
+
+```bash
+--native_renderer=true            # live: native frames on screen, emulator GPU still draws
+--native_detached=true            # with it: the emulator's GPU draws nothing (gpu_skip_draws)
+--native_stats_interval=300       # log draws / resolves / GPU time every 300 frames
+```
+
+Ported 2026-10-20 from the first renderer's phase 5 (commit 3823000 on
+`native-renderer-vk`; its capture-side code came over unchanged).
+
+- **Live rendering**: the capture hooks (`src/native_capture.cpp`) feed the
+  renderer every frame, without the capture's checks (ring parsing for shader
+  loads, registers outside the shadow and draw packets stays). Two frames in
+  flight, each with its own command lists, fence, arenas and descriptor sets;
+  captures (F6) still work in live mode and read back that frame.
+- **Presentation**: at Swap the front buffer (the texture object Swap gets,
+  r4) is drawn through the guest's 256-entry gamma ramp (DC_LUT_30_COLOR, from
+  the command processor; `glsl/present_gamma_table.frag`) into the SDK
+  presenter's guest output image (`Presenter::RefreshGuestOutput`, the same
+  hand-over the emulator uses), so pacing, FSR/CAS, overlays and screenshots
+  keep working. The image the presenter lends is wrapped as a Plume texture
+  (`WrapImage` in `plume_device.cpp`: Plume's non-owning `VulkanTexture`, as
+  for swapchain images), and the frame is submitted inside the hand-over.
+- **SDK switches** (fix/stability f5658a7): `present_guest_swaps=false` stops
+  the emulator's present (its swap still ends its frame), `gpu_skip_draws=true`
+  makes the command processor skip draws and resolves; the gamma ramp
+  accessors are public. The native renderer sets both itself.
+- **Persistent resolved textures**: kept across frames (auto-exposure, the
+  depth-of-field and bloom ping-pong read last frame's). A resolved texture is
+  dropped when the CPU puts something else in its memory (16 x 64 bytes of it,
+  sampled at the resolve, no longer match). Captures without live rendering
+  start each frame without them. Live comparisons with the emulator's
+  resolves in memory: `--readback_resolve=full --native_keep_resolves=true`.
+- **CPU cost**: textures and vertex buffers are re-hashed / re-copied only when
+  guest pages they cover were written since (SDK physical memory invalidation
+  callbacks with per-page write epochs, `native_page_watch`).
+- GPU time per frame comes from timestamp queries (Plume query pools).
+
+Results (2026-10-20, RTX 4060, Fenway at-bat at 1x with 4x MSAA): screenshots
+of the native frames against the emulator's (`out/perf/plive1` vs `pemu1`,
+`tools/atbat.sh`) 0.69-0.93/255 (the first renderer: 2.0-2.3/255); every draw
+drawn, 0 texture failures; GPU 8-10 ms per frame at the plate; the validation
+layer reports nothing beyond the SDK's own messages. 60 fps benchmark
+(`tools/perf/bench.sh`, plate):
+
+| | GPU command thread | game render thread | fps |
+|---|---|---|---|
+| emulator (2026-10-15) | 12.0 ms | 6.4 ms | 60 |
+| native, detached, hashing every frame | 2.6 ms | 23.8 ms | 42 |
+| native, detached, page watch | 1.7 ms | 15.4 ms | 60 |
+
+The native work runs on the render thread (draw recording, index conversion,
+vertex copies, driver), so it adds to the game's frame time instead of running
+beside it like the command processor did. Next (phase 6 of the first
+renderer): record on a thread of its own, resolution scaling, AA options.
 
 ## Phase 2: resource conversion (`src/native/`)
 

@@ -12,9 +12,12 @@
 #include <memory>
 #include <string>
 
+#include <rex/ui/vulkan/api.h>
+
 namespace plume {
 struct RenderDevice;
 struct RenderInterface;
+struct RenderTexture;
 }  // namespace plume
 namespace rex::ui::vulkan {
 class VulkanDevice;
@@ -32,6 +35,13 @@ struct PlumeDevice {
 // Wraps the SDK's device. The SDK device must outlive the result.
 std::unique_ptr<PlumeDevice> CreatePlumeDevice(const rex::ui::vulkan::VulkanDevice* device,
                                                std::string* error);
+
+// A 2D color-target texture over a VkImage someone else owns (the SDK
+// presenter's guest output), contents discarded. read_before: earlier
+// commands may still sample it (the wrapped texture's first barrier waits for
+// them). The image must outlive the texture.
+std::unique_ptr<plume::RenderTexture> WrapImage(PlumeDevice& device, VkImage image, VkFormat format,
+                                                uint32_t width, uint32_t height, bool read_before);
 
 // --native_plume_selftest: clears a render target, copies it to a readback
 // buffer, and checks the pixels; also checks a buffer copy. Logs the result.

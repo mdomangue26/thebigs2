@@ -11,7 +11,11 @@ namespace tb2 {
 void NativeCaptureInit(const std::filesystem::path& out_dir);
 
 // Called from the D3D Swap hook (frame boundary), before and after the swap.
-void NativeCaptureOnSwap(uint8_t* base);
+// front_buffer: the texture object the swap shows (Swap's second argument).
+void NativeCaptureOnSwap(uint8_t* base, uint32_t front_buffer);
 void NativeCaptureAfterSwap(uint8_t* base);
+
+// Releases the native renderer (app shutdown, before the SDK's teardown).
+void NativeCaptureShutdown();
 
 }  // namespace tb2

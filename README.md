@@ -82,6 +82,7 @@ these fixes on a local branch (`fix/stability`, not in the upstream SDK):
 | 87978cb | Write-watch faults no longer parse `/proc/self/maps` under the global lock | Every game write to GPU-watched memory stalls the GPU thread and other game threads (~20% of the GPU thread's frame time) |
 | 8088994 | Shared memory validity checked without the global lock | The GPU thread contends with game threads on every draw |
 | e806d48 | Cheaper per-draw constants and cvar check; `cp_frame_stats` | ~10% more GPU thread time per frame |
+| f5658a7 | `present_guest_swaps` / `gpu_skip_draws` switches, public gamma ramp accessors | The native renderer (`native_renderer`) doesn't build |
 
 With an unpatched SDK the game still runs; use `resolution_scale = 1` and
 leave `frame_rate` at 30.
@@ -171,6 +172,8 @@ Settings live in **`thebigs2.toml`**:
 | `gpu_backend` | `"vulkan"` | Graphics API. Windows only: `"d3d12"` is the alternative (untested, see section 6) |
 | `frame_rate` | `30` | Frame rate in matches: `30` (the game's own) or `60` — **60 is experimental** (see below). Replaces `fps_60`, which still works |
 | `scene_msaa` | automatic | The game's 4x MSAA on the main scene; automatic = on at 1x, off at 2x+ and on the Steam Deck (see below) |
+| `native_renderer` | `false` | Draw with the native Vulkan renderer instead of the GPU emulation — **experimental** (see *Native renderer*) |
+| `native_detached` | `false` | With `native_renderer`: the GPU emulation stops drawing altogether |
 | `fps_log_interval` | `0` | Log the frame rate every N seconds (`0` = off) |
 | `bind_quit` | `"F10"` | Quit key |
 | `mnk_mode` | `true` | Keyboard plays as player 1's controller (alongside the first pad) |
@@ -380,6 +383,20 @@ which the driver doesn't survive. The fix (cube maps sampled with an LOD
 computed from the gradients, setting `spirv_cube_lod_from_gradients`) is
 SDK commit a52de02 (see *SDK fixes* in section 1); with an unpatched SDK use
 `--resolution_scale=1`.
+
+### Native renderer (experimental)
+
+`native_renderer = true` draws the game with a renderer of its own (Vulkan,
+`src/native/`) from the game's Direct3D calls, instead of emulating the Xbox
+360 GPU; the emulator's frames are no longer shown. `native_detached = true`
+also stops the GPU emulation from drawing (it still runs the command stream
+for synchronization). Frames match the emulator's to about 1/255. Limits for
+now: it always renders at 720p (`resolution_scale` doesn't apply; the image is
+upscaled for the window), so use `resolution_scale = 1` with it to keep the
+game's 4x MSAA (`scene_msaa` is off at 2x), and it works only with the Vulkan
+backend. Its work runs on the game's render thread: at the plate that is about
+the same CPU time per frame as the emulator's GPU thread (60 fps both ways on
+a Ryzen 5 5600). Development notes: [docs/native-renderer.md](docs/native-renderer.md).
 
 ### Quitting and hotkeys
 

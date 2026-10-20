@@ -168,6 +168,7 @@ class Thebigs2App : public rex::ReXApp {
   }
 
   void OnShutdown() override {
+    tb2::NativeCaptureShutdown();
     stop_poller_.store(true, std::memory_order_relaxed);
     if (quit_poller_.joinable()) quit_poller_.join();
   }

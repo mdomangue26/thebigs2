@@ -70,6 +70,30 @@ std::unique_ptr<PlumeDevice> CreatePlumeDevice(const rex::ui::vulkan::VulkanDevi
   return result;
 }
 
+std::unique_ptr<plume::RenderTexture> WrapImage(PlumeDevice& device, VkImage image, VkFormat format,
+                                                uint32_t width, uint32_t height, bool read_before) {
+  using namespace plume;
+  // Plume's swapchain textures work this way: a VulkanTexture that doesn't own
+  // its image.
+  auto texture = std::make_unique<VulkanTexture>(static_cast<VulkanDevice*>(device.device.get()), image);
+  RenderFormat render_format = RenderFormat::UNKNOWN;
+  switch (format) {
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: render_format = RenderFormat::R10G10B10A2_UNORM; break;
+    case VK_FORMAT_R8G8B8A8_UNORM: render_format = RenderFormat::R8G8B8A8_UNORM; break;
+    case VK_FORMAT_B8G8R8A8_UNORM: render_format = RenderFormat::B8G8R8A8_UNORM; break;
+    default: return nullptr;
+  }
+  texture->desc = RenderTextureDesc::Texture2D(width, height, 1, render_format,
+                                               RenderTextureFlag::RENDER_TARGET);
+  texture->imageFormat = format;
+  texture->textureLayout = RenderTextureLayout::UNKNOWN;
+  texture->barrierStages = read_before ? RenderBarrierStage::GRAPHICS : RenderBarrierStage::NONE;
+  texture->fillSubresourceRange();
+  texture->createImageView(format);
+  if (!texture->imageView) return nullptr;
+  return texture;
+}
+
 bool PlumeSelfTest(PlumeDevice& plume_device) {
   using namespace plume;
   RenderDevice& device = *plume_device.device;

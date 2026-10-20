@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cfloat>
 #include <cmath>
@@ -28,7 +29,10 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
+#include <rex/memory.h>
+#include <rex/ui/presenter.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/instance.h>
 
 #include <plume_render_interface.h>
@@ -44,6 +48,7 @@ namespace {
 
 #include "glsl/pack_depth_ms_ps.h"
 #include "glsl/pack_depth_ps.h"
+#include "glsl/present_gamma_table_ps.h"
 #include "glsl/present_vs.h"
 #include "glsl/resolve_ms_ps.h"
 #include "glsl/resolve_ps.h"
@@ -74,6 +79,61 @@ constexpr uint32_t kBlendControlRegs[4] = {
     xg::XE_GPU_REG_RB_BLENDCONTROL3};
 
 // --- Small helpers -----------------------------------------------------------
+
+// CPU writes to guest memory, per 4 KB page, as write epochs: through the
+// SDK's physical memory invalidation callbacks (one-shot write protection, as
+// the emulator's shared memory uses). Data read after Watch() returned epoch e
+// is unchanged while every page's last write is <= e. Without guest memory
+// attached nothing counts as unchanged.
+class PageWatch {
+ public:
+  static constexpr uint32_t kPages = 0x20000000u >> 12;
+
+  // Never destroyed: the SDK may call back until the process ends.
+  static PageWatch& Get() {
+    static PageWatch* watch = new PageWatch;
+    return *watch;
+  }
+  void Attach(rex::memory::Memory* memory) {
+    if (memory_ || !memory) return;
+    memory_ = memory;
+    memory->RegisterPhysicalMemoryInvalidationCallback(Invalidate, this);
+  }
+  bool attached() const { return memory_ != nullptr; }
+
+  // Call before reading the memory; returns the epoch to check against.
+  uint64_t Watch(uint32_t address, uint32_t bytes) {
+    const uint64_t epoch = epoch_.load(std::memory_order_acquire);
+    if (memory_ && bytes && address + uint64_t(bytes) <= 0x20000000)
+      memory_->EnablePhysicalMemoryAccessCallbacks(address, bytes, true, false);
+    return epoch;
+  }
+  bool Unchanged(uint32_t address, uint32_t bytes, uint64_t since) const {
+    if (!memory_ || !since || !bytes || address + uint64_t(bytes) > 0x20000000) return false;
+    for (uint32_t page = address >> 12, last = (address + bytes - 1) >> 12; page <= last; ++page)
+      if (written_[page].load(std::memory_order_relaxed) > since) return false;
+    return true;
+  }
+
+ private:
+  static std::pair<uint32_t, uint32_t> Invalidate(void* context, uint32_t address,
+                                                  uint32_t length, bool) {
+    auto& self = *static_cast<PageWatch*>(context);
+    if (length && address < 0x20000000) {
+      const uint64_t epoch = self.epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+      const uint32_t last =
+          uint32_t(std::min<uint64_t>(uint64_t(address) + length - 1, 0x1FFFFFFF) >> 12);
+      for (uint32_t page = address >> 12; page <= last; ++page)
+        self.written_[page].store(epoch, std::memory_order_relaxed);
+    }
+    // Only the pages reported here may be unwatched: others stay protected.
+    return {address, length};
+  }
+
+  rex::memory::Memory* memory_ = nullptr;
+  std::atomic<uint64_t> epoch_{1};
+  std::unique_ptr<std::atomic<uint64_t>[]> written_{new std::atomic<uint64_t>[kPages]()};
+};
 
 float HalfToFloat(uint16_t h) {
   const uint32_t sign = uint32_t(h >> 15) << 31, exp = (h >> 10) & 0x1F, mant = h & 0x3FF;
@@ -423,6 +483,7 @@ struct TextureEntry {
   Image image;
   uint64_t content_hash = 0;
   uint64_t validated_frame = 0;
+  uint64_t watched_epoch = 0;  // PageWatch epoch the content was hashed at
   // Depth resolves: image holds float depth (for depth fetch formats), packed
   // the 32-bit words the console writes to memory, (depth24 << 8) | stencil,
   // for textures that read that memory as color (the composite pass reads the
@@ -434,7 +495,23 @@ struct TextureEntry {
   // destination's fetch swizzle gives that order back.
   bool from_resolve = false;
   uint32_t resolve_swizzle = 0;  // the destination fetch constant's swizzle
+  // Resolved textures: the guest memory they stand for, as it was when
+  // resolved (nothing writes it: the CPU replacing it means a texture again).
+  uint32_t memory_address = 0, memory_bytes = 0;
+  uint64_t memory_sample = 0;
 };
+
+// A cheap fingerprint of a guest memory range: 16 spread 64-byte pieces.
+uint64_t SampleMemory(const uint8_t* memory, uint32_t address, uint32_t bytes) {
+  if (!bytes || uint64_t(address) + bytes > 0x20000000) return 0;
+  const uint8_t* base = memory + 0xA0000000u + address;
+  uint64_t hash = 0;
+  for (uint32_t i = 0; i < 16; ++i) {
+    const uint32_t offset = uint32_t(uint64_t(bytes) * i / 16);
+    hash = XXH3_64bits_withSeed(base + offset, std::min<uint32_t>(64, bytes - offset), hash);
+  }
+  return hash;
+}
 
 // View swizzle for sampling a resolved texture through a fetch swizzle:
 // memory component m holds render target component k where
@@ -461,16 +538,22 @@ struct Readback {
   VkFormat format = VK_FORMAT_UNDEFINED;
 };
 
-// Descriptor sets of one layout, reused frame after frame (each draw takes the
-// next one; the frame has finished before they are rewritten).
+constexpr uint32_t kFramesInFlight = 2;
+
+// Descriptor sets of one layout, per frame in flight, reused frame after frame
+// (each draw takes the next one; that frame has finished before they are
+// rewritten).
 struct SetPool {
   pl::RenderDescriptorSetBuilder builder;
-  std::vector<std::unique_ptr<pl::RenderDescriptorSet>> sets;
-  size_t used = 0;
+  std::vector<std::unique_ptr<pl::RenderDescriptorSet>> sets[kFramesInFlight];
+  size_t used[kFramesInFlight] = {};
 
-  pl::RenderDescriptorSet* Next(pl::RenderDevice* device) {
-    if (used == sets.size()) sets.push_back(builder.create(device));
-    return sets[used++].get();
+  pl::RenderDescriptorSet* Next(pl::RenderDevice* device, uint32_t frame) {
+    if (used[frame] == sets[frame].size()) sets[frame].push_back(builder.create(device));
+    return sets[frame][used[frame]++].get();
+  }
+  void Clear() {
+    for (auto& s : sets) s.clear();
   }
 };
 
@@ -487,15 +570,36 @@ struct Renderer::Impl {
   std::unique_ptr<ShaderLibrary> library;
 
   std::unique_ptr<pl::RenderCommandQueue> queue;
-  // Texture uploads go into their own list, submitted before the draws.
-  std::unique_ptr<pl::RenderCommandList> upload_list, draw_list;
-  std::unique_ptr<pl::RenderCommandFence> fence;
+  // What each frame in flight owns.
+  struct FrameContext {
+    // Texture uploads go into their own list, submitted before the draws.
+    std::unique_ptr<pl::RenderCommandList> upload_list, draw_list;
+    std::unique_ptr<pl::RenderCommandFence> fence;
+    bool submitted = false;
+    Arena vertex_arena, uniform_arena, staging_arena;
+    pl::RenderDescriptorSet* shared_set = nullptr;  // the vertex arena
+    std::vector<Image> garbage;  // replaced during the frame, destroyed after it
+    // The presenter's guest output as the frame wrote it.
+    std::vector<std::unique_ptr<pl::RenderFramebuffer>> output_framebuffers;
+    std::vector<std::unique_ptr<pl::RenderTexture>> outputs;
+    std::unique_ptr<pl::RenderQueryPool> timestamps;  // start, end
+  };
+  FrameContext contexts[kFramesInFlight];
+  uint32_t context_index = 0;
+  FrameContext& Context() { return contexts[context_index]; }
+  // The current frame's (BeginFrame).
+  pl::RenderCommandList* upload_list = nullptr;
+  pl::RenderCommandList* draw_list = nullptr;
+  Arena* vertex_arena = nullptr;
+  Arena* uniform_arena = nullptr;
+  Arena* staging_arena = nullptr;
+  double timestamp_period_ns = 0;  // 0: no GPU timing
 
   // Descriptor set layouts (VulkanCommandProcessor::SetupContext): shared
   // memory (the vertex arena), constants, textures + samplers per stage.
   SetPool shared_pool, constants_pool, empty_pool;
   std::map<std::tuple<bool, uint32_t, uint32_t>, SetPool> texture_pools;
-  pl::RenderDescriptorSet* shared_set = nullptr;
+  pl::RenderDescriptorSet* shared_set = nullptr;  // the current frame's
   std::map<std::array<uint32_t, 4>, std::unique_ptr<pl::RenderPipelineLayout>> pipeline_layouts;
   std::unordered_map<const void*, std::unique_ptr<pl::RenderShader>> shaders;
   std::unordered_map<PipelineKey, std::unique_ptr<pl::RenderPipeline>, PipelineKeyHash> pipelines;
@@ -505,7 +609,6 @@ struct Renderer::Impl {
   std::unordered_map<uint64_t, TextureEntry> textures;  // key hash -> texture
   std::unordered_map<uint32_t, TextureEntry> resolved;   // this frame: dest base page -> texture
   Image dummy_2d, dummy_cube, dummy_3d;
-  std::vector<Image> garbage;  // replaced during the frame, destroyed after it
   std::unordered_map<uint32_t, bool> linear_filterable;  // VkFormat ->
 
   // Resolves: a fullscreen triangle sampling the render target.
@@ -515,18 +618,26 @@ struct Renderer::Impl {
   std::unique_ptr<pl::RenderPipelineLayout> resolve_layout;
   std::map<std::tuple<uint32_t, uint32_t, bool>, std::unique_ptr<pl::RenderPipeline>>
       resolve_pipelines;  // (dest format, samples, depth)
+  // Present pass (glsl/present_gamma_table.frag).
+  std::unique_ptr<pl::RenderShader> present_shader;
+  SetPool present_pool;
+  std::unique_ptr<pl::RenderPipelineLayout> present_layout;
+  std::unique_ptr<pl::RenderPipeline> present_pipeline;
   // Packed depth resolves (glsl/pack_depth*.frag).
   std::unique_ptr<pl::RenderShader> pack_shader, pack_ms_shader;
   SetPool pack_pool;
   std::unique_ptr<pl::RenderPipelineLayout> pack_layout;
   std::map<uint32_t, std::unique_ptr<pl::RenderPipeline>> pack_pipelines;  // samples ->
 
-  Arena vertex_arena, uniform_arena, staging_arena;
-  std::unordered_map<uint64_t, uint64_t> vertex_copies;  // (address, size, hash) -> offset
+  // Vertex buffers copied this frame: (address, size) -> offset + watch epoch;
+  // or with no page watch, (address, size, content hash) -> offset.
+  std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> vertex_copies;
   uint64_t uniform_ranges[SpirvShaderTranslator::kConstantBufferCount] = {};
 
   const uint8_t* memory = nullptr;
   uint64_t frame = 0;
+  bool readback = false;       // this frame's resolves are read back
+  bool keep_resolves = false;  // SetKeepResolves
   int32_t anisotropic_override = -1;  // the SDK's setting, read per frame
   bool frame_open = false;
   bool rendering = false;
@@ -549,7 +660,7 @@ struct Renderer::Impl {
   bool CreateImage(Image& image, pl::RenderTextureFlags flags);
   // For images the frame's commands may still use.
   void DestroyLater(Image& image) {
-    if (image.texture) garbage.push_back(std::move(image));
+    if (image.texture) Context().garbage.push_back(std::move(image));
     image = Image{};
   }
   bool LinearFilterable(VkFormat format);
@@ -580,6 +691,8 @@ struct Renderer::Impl {
   pl::RenderPipeline* Pipeline(const PipelineKey& key);
   pl::RenderPipeline* ResolvePipeline(VkFormat dest_format, uint32_t samples, bool depth);
   pl::RenderPipeline* PackPipeline(uint32_t samples);
+  void RecordPresent(VkImage target, bool target_read_before, TextureEntry& source,
+                     const uint32_t* gamma_ramp);
   // A resolve's draw: the render target region into a destination texture.
   void DrawResolve(Image& dest, RenderTarget& rt, pl::RenderPipeline* pipeline,
                    pl::RenderPipelineLayout* layout, pl::RenderDescriptorSet* set,
@@ -591,13 +704,14 @@ struct Renderer::Impl {
 
 Renderer::Impl::~Impl() {
   if (!device) return;
-  // The last frame was waited for in EndFrame. Destroy everything Plume made
-  // before the device wrapper goes.
+  // Destroy everything Plume made (after the frames in flight) before the
+  // device wrapper goes.
+  for (FrameContext& c : contexts)
+    if (c.submitted) queue->waitForCommandFence(c.fence.get());
   framebuffers.clear();
   render_targets.clear();
   textures.clear();
   resolved.clear();
-  garbage.clear();
   dummy_2d = Image{}, dummy_cube = Image{}, dummy_3d = Image{};
   readbacks.clear();
   pipelines.clear();
@@ -607,18 +721,24 @@ Renderer::Impl::~Impl() {
   shaders.clear();
   pack_pipelines.clear();
   pack_layout.reset();
-  pack_pool.sets.clear();
+  pack_pool.Clear();
+  present_pipeline.reset();
+  present_layout.reset();
+  present_pool.Clear();
+  present_shader.reset();
   pack_shader.reset(), pack_ms_shader.reset();
   resolve_vs_shader.reset(), resolve_shader.reset(), resolve_ms_shader.reset();
   samplers.clear();
   point_sampler.reset();
   texture_pools.clear();
-  shared_pool.sets.clear(), constants_pool.sets.clear(), empty_pool.sets.clear();
-  resolve_pool.sets.clear();
-  for (Arena* a : {&vertex_arena, &uniform_arena, &staging_arena})
-    if (a->buffer) a->buffer->unmap();
-  vertex_arena = Arena{}, uniform_arena = Arena{}, staging_arena = Arena{};
-  upload_list.reset(), draw_list.reset(), fence.reset(), queue.reset();
+  shared_pool.Clear(), constants_pool.Clear(), empty_pool.Clear();
+  resolve_pool.Clear();
+  for (FrameContext& c : contexts) {
+    for (Arena* a : {&c.vertex_arena, &c.uniform_arena, &c.staging_arena})
+      if (a->buffer) a->buffer->unmap();
+    c = FrameContext{};
+  }
+  queue.reset();
 }
 
 bool Renderer::Impl::CreateArena(Arena& arena, uint64_t size, pl::RenderBufferFlags flags) {
@@ -693,22 +813,30 @@ bool Renderer::Impl::Init(const VulkanDevice* sdk_device, std::string* error) {
 
   queue = device->createCommandQueue(pl::RenderCommandListType::DIRECT);
   if (!queue) return fail("Plume: no command queue");
-  upload_list = queue->createCommandList();
-  draw_list = queue->createCommandList();
-  fence = device->createCommandFence();
-  if (!upload_list || !draw_list || !fence) return fail("Plume: no command lists");
-
-  if (!CreateArena(vertex_arena, kVertexArenaSize,
-                   pl::RenderBufferFlag::STORAGE | pl::RenderBufferFlag::INDEX) ||
-      !CreateArena(uniform_arena, kUniformArenaSize, pl::RenderBufferFlag::CONSTANT) ||
-      !CreateArena(staging_arena, kStagingArenaSize, pl::RenderBufferFlag::NONE))
-    return fail("buffer allocation failed");
-
   shared_pool.builder.begin();
   shared_pool.builder.addStructuredBuffer(0);
   shared_pool.builder.end();
-  shared_set = shared_pool.Next(device);
-  shared_set->setBuffer(0, vertex_arena.buffer.get());
+  for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+    FrameContext& c = contexts[i];
+    c.upload_list = queue->createCommandList();
+    c.draw_list = queue->createCommandList();
+    c.fence = device->createCommandFence();
+    if (!c.upload_list || !c.draw_list || !c.fence) return fail("Plume: no command lists");
+    if (!CreateArena(c.vertex_arena, kVertexArenaSize,
+                     pl::RenderBufferFlag::STORAGE | pl::RenderBufferFlag::INDEX) ||
+        !CreateArena(c.uniform_arena, kUniformArenaSize, pl::RenderBufferFlag::CONSTANT) ||
+        !CreateArena(c.staging_arena, kStagingArenaSize, pl::RenderBufferFlag::NONE))
+      return fail("buffer allocation failed");
+    c.shared_set = shared_pool.Next(device, i);
+    c.shared_set->setBuffer(0, c.vertex_arena.buffer.get());
+    c.timestamps = device->createQueryPool(2);
+  }
+  {
+    VkPhysicalDeviceProperties properties;
+    dev->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(dev->physical_device(),
+                                                                      &properties);
+    if (contexts[0].timestamps) timestamp_period_ns = properties.limits.timestampPeriod;
+  }
   constants_pool.builder.begin();
   for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i)
     constants_pool.builder.addConstantBuffer(i);
@@ -759,6 +887,29 @@ bool Renderer::Impl::Init(const VulkanDevice* sdk_device, std::string* error) {
   layout.addDescriptorSet(resolve_pool.builder);
   layout.end();
   resolve_layout = layout.create(device);
+  // Presentation.
+  present_shader = device->createShader(present_gamma_table_ps, sizeof(present_gamma_table_ps),
+                                        "main", pl::RenderShaderFormat::SPIRV);
+  present_pool.builder.begin();
+  present_pool.builder.addTexture(0);
+  present_pool.builder.addConstantBuffer(1);
+  present_pool.builder.addSampler(2);
+  present_pool.builder.end();
+  layout.begin();
+  layout.addDescriptorSet(present_pool.builder);
+  layout.end();
+  present_layout = layout.create(device);
+  if (present_shader && present_layout) {
+    pl::RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = present_layout.get();
+    desc.vertexShader = resolve_vs_shader.get();
+    desc.pixelShader = present_shader.get();
+    desc.renderTargetCount = 1;
+    desc.renderTargetFormat[0] = pl::RenderFormat::R10G10B10A2_UNORM;  // kGuestOutputFormat
+    desc.renderTargetBlend[0] = pl::RenderBlendDesc::Copy();
+    present_pipeline = device->createGraphicsPipeline(desc);
+  }
+
   pack_shader = device->createShader(pack_depth_ps, sizeof(pack_depth_ps), "main",
                                      pl::RenderShaderFormat::SPIRV);
   pack_ms_shader = device->createShader(pack_depth_ms_ps, sizeof(pack_depth_ms_ps), "main",
@@ -774,7 +925,7 @@ bool Renderer::Impl::Init(const VulkanDevice* sdk_device, std::string* error) {
   layout.end();
   pack_layout = layout.create(device);
   if (!resolve_vs_shader || !resolve_shader || !resolve_ms_shader || !point_sampler ||
-      !resolve_layout || !pack_shader || !pack_ms_shader || !pack_layout)
+      !resolve_layout || !pack_shader || !pack_ms_shader || !pack_layout || !present_pipeline)
     return fail("resolve pipeline objects");
   return true;
 }
@@ -888,8 +1039,16 @@ void Renderer::Impl::ClearRegion(RenderTarget& rt, const pl::RenderRect* rect,
 TextureEntry* Renderer::Impl::GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   if (fetch.type != xenos::FetchConstantType::kTexture) return nullptr;
   if (auto it = resolved.find(fetch.base_address); it != resolved.end()) {
-    ++stats.textures_from_resolves;
-    return &it->second;
+    TextureEntry& r = it->second;
+    if (keep_resolves || SampleMemory(memory, r.memory_address, r.memory_bytes) == r.memory_sample) {
+      ++stats.textures_from_resolves;
+      return &r;
+    }
+    // The CPU has put something else there: a texture from memory again.
+    DestroyLater(r.image);
+    DestroyLater(r.packed);
+    resolved.erase(it);
+    ++stats.resolves_overwritten;
   }
   // Identity: everything that shapes the data (not filtering or swizzles).
   const uint32_t key_fields[] = {
@@ -900,6 +1059,7 @@ TextureEntry* Renderer::Impl::GetTexture(const xenos::xe_gpu_texture_fetch_t& fe
   const uint64_t key = XXH3_64bits(key_fields, sizeof(key_fields));
   TextureEntry& entry = textures[key];
   if (entry.image.texture && entry.validated_frame == frame) return &entry;
+  PageWatch& pages = PageWatch::Get();
 
   // Content hash of the guest memory the texture occupies.
   uint32_t width_m1, height_m1, depth_m1, base_page, mip_page, mip_min, mip_max;
@@ -910,6 +1070,16 @@ TextureEntry* Renderer::Impl::GetTexture(const xenos::xe_gpu_texture_fetch_t& fe
       fetch.format, fetch.packed_mips, true, mip_max);
   const uint32_t base_size = layout.base.level_data_extent_bytes;
   const uint32_t mip_size = layout.mips_total_extent_bytes;
+  // Unchanged memory since it was last checked: no need to hash it again.
+  const uint32_t mip_bytes = mip_page && mip_max > 0 ? mip_size : 0;
+  if (entry.image.texture && base_page &&
+      pages.Unchanged(base_page << 12, base_size, entry.watched_epoch) &&
+      (!mip_bytes || pages.Unchanged(mip_page << 12, mip_bytes, entry.watched_epoch))) {
+    entry.validated_frame = frame;
+    return &entry;
+  }
+  const uint64_t epoch = pages.Watch(base_page << 12, base_size);
+  pages.Watch(mip_page << 12, mip_bytes);
   uint64_t content = 0;
   if (base_page && (base_page << 12) + uint64_t(base_size) <= 0x20000000)
     content = XXH3_64bits(memory + 0xA0000000u + (base_page << 12), base_size);
@@ -917,6 +1087,7 @@ TextureEntry* Renderer::Impl::GetTexture(const xenos::xe_gpu_texture_fetch_t& fe
     content = XXH3_64bits_withSeed(memory + 0xA0000000u + (mip_page << 12), mip_size, content);
   if (entry.image.texture && entry.content_hash == content) {
     entry.validated_frame = frame;
+    entry.watched_epoch = epoch;
     return &entry;
   }
 
@@ -930,7 +1101,7 @@ TextureEntry* Renderer::Impl::GetTexture(const xenos::xe_gpu_texture_fetch_t& fe
   std::string error;
   if (!ConvertTexture(memory, fetch, host, &error)) return failed(error);
   uint64_t staging_offset;
-  uint8_t* staging = Allocate(staging_arena, host.data.size(), 16, staging_offset);
+  uint8_t* staging = Allocate(*staging_arena, host.data.size(), 16, staging_offset);
   if (!staging) return failed("staging buffer full");
   std::memcpy(staging, host.data.data(), host.data.size());
   stats.upload_bytes += host.data.size();
@@ -955,13 +1126,14 @@ TextureEntry* Renderer::Impl::GetTexture(const xenos::xe_gpu_texture_fetch_t& fe
         upload_list->copyTextureRegion(
             pl::RenderTextureCopyLocation::Subresource(image.texture.get(), level, layer),
             pl::RenderTextureCopyLocation::PlacedFootprint(
-                staging_arena.buffer.get(), format, l.width, l.height, 1, row_texels,
+                staging_arena->buffer.get(), format, l.width, l.height, 1, row_texels,
                 staging_offset + l.offset + layer * l.layer_bytes + z * slice_bytes),
             0, 0, z);
   }
   Transition(*upload_list, image, pl::RenderTextureLayout::SHADER_READ);
   entry.content_hash = content;
   entry.validated_frame = frame;
+  entry.watched_epoch = epoch;
   ++stats.textures_uploaded;
   return &entry;
 }
@@ -1502,16 +1674,22 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
     const uint32_t address = vf.address << 2, bytes = vf.size << 2;
     if (!bytes || uint64_t(address) + bytes > 0x20000000) continue;
     const uint8_t* src = memory + 0xA0000000u + address;
-    const uint64_t content = XXH3_64bits(src, bytes) ^ (uint64_t(address) << 32) ^ bytes;
+    PageWatch& pages = PageWatch::Get();
+    const uint64_t key = pages.attached()
+                             ? uint64_t(address) << 32 | bytes
+                             : XXH3_64bits(src, bytes) ^ (uint64_t(address) << 32) ^ bytes;
     uint64_t offset;
-    if (auto it = vertex_copies.find(content); it != vertex_copies.end()) {
-      offset = it->second;
+    auto it = vertex_copies.find(key);
+    if (it != vertex_copies.end() &&
+        (!pages.attached() || pages.Unchanged(address, bytes, it->second.second))) {
+      offset = it->second.first;
     } else {
-      uint8_t* dst = Allocate(vertex_arena, bytes, 256, offset);
+      const uint64_t epoch = pages.Watch(address, bytes);
+      uint8_t* dst = Allocate(*vertex_arena, bytes, 256, offset);
       if (!dst) return skip("vertex arena full");
       std::memcpy(dst, src, bytes);
       stats.vertex_bytes += bytes;
-      vertex_copies.emplace(content, offset);
+      vertex_copies[key] = {offset, epoch};
     }
     uint32_t& dword0 = fetch_constants[binding.fetch_constant * 2];
     dword0 = (dword0 & 3) | uint32_t(offset);
@@ -1519,18 +1697,18 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
 
   // Constants: one set per draw, its buffers at this draw's offsets.
   const uint64_t ubo_align = props.minUniformBufferOffsetAlignment;
-  pl::RenderDescriptorSet* constants_set = constants_pool.Next(device);
+  pl::RenderDescriptorSet* constants_set = constants_pool.Next(device, context_index);
   auto upload = [&](uint32_t index, const void* data, size_t size) {
     uint64_t offset;
     // Room for the descriptor's full range (constant ranges are fixed).
     uint8_t* dst =
-        Allocate(uniform_arena, std::max<uint64_t>(size, uniform_ranges[index]), ubo_align, offset);
+        Allocate(*uniform_arena, std::max<uint64_t>(size, uniform_ranges[index]), ubo_align, offset);
     if (!dst) return false;
     std::memcpy(dst, data, size);
     stats.uniform_bytes += size;
     // A structured view of 1-byte elements is how Plume takes a buffer offset.
     const pl::RenderBufferStructuredView at(1, uint32_t(offset));
-    constants_set->setBuffer(index, uniform_arena.buffer.get(), uniform_ranges[index], &at);
+    constants_set->setBuffer(index, uniform_arena->buffer.get(), uniform_ranges[index], &at);
     return true;
   };
   auto pack_floats = [&](const SpirvShader& shader, uint32_t first_register) {
@@ -1561,7 +1739,7 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
   // Indices.
   uint64_t index_offset = 0;
   if (host.indexed) {
-    uint8_t* dst = Allocate(vertex_arena, host.indices.size(), 4, index_offset);
+    uint8_t* dst = Allocate(*vertex_arena, host.indices.size(), 4, index_offset);
     if (!dst) return skip("vertex arena full");
     std::memcpy(dst, host.indices.data(), host.indices.size());
     stats.vertex_bytes += host.indices.size();
@@ -1576,7 +1754,7 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
     if (stage_textures.empty() && stage_samplers.empty()) continue;
     pl::RenderDescriptorSet* set =
         TexturePool(stage == 0, uint32_t(stage_textures.size()), uint32_t(stage_samplers.size()))
-            .Next(device);
+            .Next(device, context_index);
     texture_sets[stage] = set;
     for (uint32_t i = 0; i < stage_textures.size(); ++i) {
       const auto& t = stage_textures[i];
@@ -1627,7 +1805,7 @@ void Renderer::Impl::Draw(const RegisterFile& regs, std::span<const uint32_t> vs
                        ref_back.stencilmask, ref_front.stencilwritemask, ref_back.stencilwritemask);
   if (host.indexed) {
     const pl::RenderIndexBufferView index_view(
-        pl::RenderBufferReference(vertex_arena.buffer.get(), index_offset),
+        pl::RenderBufferReference(vertex_arena->buffer.get(), index_offset),
         uint32_t(host.indices.size()),
         host.index32 ? pl::RenderFormat::R32_UINT : pl::RenderFormat::R16_UINT);
     list.setIndexBuffer(&index_view);
@@ -1656,20 +1834,52 @@ const RendererStats& Renderer::stats() const { return impl_->stats; }
 
 std::string Renderer::DeviceName() const { return impl_->device->getDescription().name; }
 
-void Renderer::BeginFrame(const uint8_t* memory) {
+void Renderer::BeginFrame(const uint8_t* memory, bool readback, bool continuous) {
   Impl& m = *impl_;
   m.memory = memory;
+  m.readback = readback;
   ++m.frame;
   m.anisotropic_override = rex::cvar::Query<int32_t>("anisotropic_override");
   if (rex::cvar::GetFlagByName("anisotropic_override").empty()) m.anisotropic_override = -1;
   m.stats = RendererStats{};
-  m.vertex_arena.used = m.uniform_arena.used = m.staging_arena.used = 0;
+
+  // The next frame context, once the GPU is done with it.
+  m.context_index = (m.context_index + 1) % kFramesInFlight;
+  Impl::FrameContext& c = m.Context();
+  if (c.submitted) {
+    m.queue->waitForCommandFence(c.fence.get());
+    c.submitted = false;
+    if (c.timestamps && m.timestamp_period_ns > 0) {
+      c.timestamps->queryResults();
+      const uint64_t* t = c.timestamps->getResults();
+      m.stats.gpu_ms_previous = float(double(t[1] - t[0]) * m.timestamp_period_ns * 1e-6);
+    }
+  }
+  c.garbage.clear();
+  c.output_framebuffers.clear();
+  c.outputs.clear();
+  c.vertex_arena.used = c.uniform_arena.used = c.staging_arena.used = 0;
+  m.upload_list = c.upload_list.get();
+  m.draw_list = c.draw_list.get();
+  m.vertex_arena = &c.vertex_arena;
+  m.uniform_arena = &c.uniform_arena;
+  m.staging_arena = &c.staging_arena;
+  m.shared_set = c.shared_set;
+  for (SetPool* pool : {&m.constants_pool, &m.resolve_pool, &m.pack_pool, &m.present_pool})
+    pool->used[m.context_index] = 0;
+  for (auto& [k, pool] : m.texture_pools) pool.used[m.context_index] = 0;
   m.vertex_copies.clear();
-  m.resolved.clear();
-  m.constants_pool.used = m.resolve_pool.used = m.pack_pool.used = 0;
-  for (auto& [k, pool] : m.texture_pools) pool.used = 0;
+  if (!continuous) {
+    // Resolved textures of an earlier frame no longer stand for their memory.
+    for (auto& [k, r] : m.resolved) m.DestroyLater(r.image), m.DestroyLater(r.packed);
+    m.resolved.clear();
+  }
   m.upload_list->begin();
   m.draw_list->begin();
+  if (c.timestamps && m.timestamp_period_ns > 0) {
+    m.upload_list->resetQueryPool(c.timestamps.get(), 0, 2);
+    m.upload_list->writeTimestamp(c.timestamps.get(), 0);
+  }
   m.rendering = false;
   m.pass_colors = {};
   m.pass_depth = nullptr;
@@ -1678,13 +1888,13 @@ void Renderer::BeginFrame(const uint8_t* memory) {
   for (Image* d : {&m.dummy_2d, &m.dummy_cube, &m.dummy_3d}) {
     if (d->layout == pl::RenderTextureLayout::SHADER_READ) continue;
     uint64_t offset;
-    uint8_t* zero = m.Allocate(m.staging_arena, 4, 16, offset);
+    uint8_t* zero = m.Allocate(*m.staging_arena, 4, 16, offset);
     std::memset(zero, 0, 4);
     m.Transition(*m.upload_list, *d, pl::RenderTextureLayout::COPY_DEST);
     for (uint32_t layer = 0; layer < d->layers; ++layer)
       m.upload_list->copyTextureRegion(
           pl::RenderTextureCopyLocation::Subresource(d->texture.get(), 0, layer),
-          pl::RenderTextureCopyLocation::PlacedFootprint(m.staging_arena.buffer.get(),
+          pl::RenderTextureCopyLocation::PlacedFootprint(m.staging_arena->buffer.get(),
                                                          pl::RenderFormat::R8G8B8A8_UNORM, 1, 1,
                                                          1, 1, offset));
     m.Transition(*m.upload_list, *d, pl::RenderTextureLayout::SHADER_READ);
@@ -1782,6 +1992,16 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
   if (entry) {
     entry->from_resolve = true;
     entry->resolve_swizzle = dest.swizzle;
+    {
+      uint32_t base_page;
+      xg::texture_util::GetSubresourcesFromFetchConstant(dest, nullptr, nullptr, nullptr, &base_page,
+                                                         nullptr, nullptr, nullptr);
+      const auto layout = xg::texture_util::GetGuestTextureLayout(
+          dest.dimension, dest.pitch, dw, dh, 1, dest.tiled, dest.format, dest.packed_mips, false, 0);
+      entry->memory_address = base_page << 12;
+      entry->memory_bytes = layout.base.level_data_extent_bytes;
+      entry->memory_sample = SampleMemory(m.memory, entry->memory_address, entry->memory_bytes);
+    }
     Image& image = entry->image;
     pl::RenderCommandList& list = *m.draw_list;
     // Depth resolves also keep the packed memory words.
@@ -1809,7 +2029,7 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
                                  regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
                                      xenos::DepthRenderTargetFormat::kD24FS8};
       if (pl::RenderPipeline* pipeline = m.ResolvePipeline(dest_format, rt->image.samples, depth)) {
-        pl::RenderDescriptorSet* set = m.resolve_pool.Next(m.device);
+        pl::RenderDescriptorSet* set = m.resolve_pool.Next(m.device, m.context_index);
         set->setTexture(0, rt->image.texture.get(), pl::RenderTextureLayout::SHADER_READ);
         set->setSampler(1, m.point_sampler.get());
         m.DrawResolve(image, *rt, pipeline, m.resolve_layout.get(), set, scissor, offset, 8);
@@ -1818,7 +2038,7 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
       }
       if (packed.texture) {
         if (pl::RenderPipeline* pipeline = m.PackPipeline(rt->image.samples)) {
-          pl::RenderDescriptorSet* set = m.pack_pool.Next(m.device);
+          pl::RenderDescriptorSet* set = m.pack_pool.Next(m.device, m.context_index);
           set->setTexture(0, rt->image.texture.get(), pl::RenderTextureLayout::SHADER_READ);
           set->setTexture(1, rt->image.texture.get(), pl::RenderTextureLayout::SHADER_READ,
                           m.View(rt->image, kViewStencil, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA));
@@ -1834,7 +2054,7 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
     // emulator's copy of it in guest memory.
     Readback rb;
     rb.format = image.format;
-    if (FormatBytes(rb.format)) {
+    if (m.readback && FormatBytes(rb.format)) {
       rb.buffer = m.device->createBuffer(
           pl::RenderBufferDesc::ReadbackBuffer(uint64_t(dw) * dh * FormatBytes(rb.format)));
     }
@@ -1852,7 +2072,7 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
     }
     m.Transition(list, image, pl::RenderTextureLayout::SHADER_READ);
   }
-  if (!result.note.empty()) {
+  if (!result.note.empty() && m.readback) {
     Readback rb;
     rb.result = result;
     m.readbacks.push_back(std::move(rb));
@@ -1877,19 +2097,106 @@ void Renderer::Resolve(const RegisterFile& regs, uint32_t flags, const int32_t* 
   }
 }
 
-bool Renderer::EndFrame(std::vector<ResolvedImage>& resolves, std::string* error) {
+// Draws the front buffer through the gamma ramp into the presenter's guest
+// output image, left in the layout the presenter samples it in.
+void Renderer::Impl::RecordPresent(VkImage target, bool target_read_before, TextureEntry& source,
+                                   const uint32_t* gamma_ramp) {
+  FrameContext& c = Context();
+  const uint32_t width = source.image.width, height = source.image.height;
+  auto output = WrapImage(*plume, target, VK_FORMAT_A2B10G10R10_UNORM_PACK32, width, height,
+                          target_read_before);
+  if (!output) return Note("present: guest output not usable");
+  const pl::RenderTexture* attachment = output.get();
+  auto framebuffer = device->createFramebuffer(pl::RenderFramebufferDesc(&attachment, 1));
+  if (!framebuffer) return Note("present: no framebuffer");
+
+  // The ramp, as 64 uvec4 (std140).
+  uint64_t ramp_offset;
+  auto* ramp = reinterpret_cast<uint32_t*>(
+      Allocate(*uniform_arena, 1024, dev->properties().minUniformBufferOffsetAlignment, ramp_offset));
+  if (!ramp) return Note("present: uniform arena full");
+  bool any = false;
+  for (uint32_t i = 0; gamma_ramp && i < 256; ++i) any |= gamma_ramp[i] != 0;
+  for (uint32_t i = 0; i < 256; ++i) {
+    const uint32_t v = i * 1023 / 255;  // identity when the guest has set none
+    ramp[i] = any ? gamma_ramp[i] : (v << 20 | v << 10 | v);
+  }
+  pl::RenderDescriptorSet* set = present_pool.Next(device, context_index);
+  set->setTexture(0, source.image.texture.get(), pl::RenderTextureLayout::SHADER_READ);
+  const pl::RenderBufferStructuredView at(1, uint32_t(ramp_offset));
+  set->setBuffer(1, uniform_arena->buffer.get(), 1024, &at);
+  set->setSampler(2, point_sampler.get());
+
+  pl::RenderCommandList& list = *draw_list;
+  Transition(list, source.image, pl::RenderTextureLayout::SHADER_READ);
+  list.barriers(kAllStages, pl::RenderTextureBarrier(output.get(), pl::RenderTextureLayout::COLOR_WRITE));
+  list.setFramebuffer(framebuffer.get());
+  list.setGraphicsPipelineLayout(present_layout.get());
+  list.setPipeline(present_pipeline.get());
+  list.setGraphicsDescriptorSet(set, 0);
+  const pl::RenderViewport viewport(0.0f, 0.0f, float(width), float(height));
+  const pl::RenderRect scissor(0, 0, int32_t(width), int32_t(height));
+  list.setViewports(&viewport, 1);
+  list.setScissors(&scissor, 1);
+  list.drawInstanced(3, 1, 0, 0);
+  list.setFramebuffer(nullptr);
+  // VulkanPresenter::kGuestOutputInternalLayout.
+  list.barriers(pl::RenderBarrierStage::GRAPHICS,
+                pl::RenderTextureBarrier(output.get(), pl::RenderTextureLayout::SHADER_READ));
+  c.output_framebuffers.push_back(std::move(framebuffer));
+  c.outputs.push_back(std::move(output));
+}
+
+bool Renderer::EndFrame(const PresentRequest* present, std::vector<ResolvedImage>* resolves,
+                        std::string* error) {
   Impl& m = *impl_;
   if (!m.frame_open) return false;
   m.frame_open = false;
   m.EndRendering();
-  m.upload_list->end();
-  m.draw_list->end();
-  const pl::RenderCommandList* lists[2] = {m.upload_list.get(), m.draw_list.get()};
-  m.queue->executeCommandLists(lists, 2, nullptr, 0, nullptr, 0, m.fence.get());
-  m.queue->waitForCommandFence(m.fence.get());
-  m.garbage.clear();
+  Impl::FrameContext& c = m.Context();
+  bool submitted = false;
+  auto submit = [&] {
+    if (c.timestamps && m.timestamp_period_ns > 0) m.draw_list->writeTimestamp(c.timestamps.get(), 1);
+    m.upload_list->end();
+    m.draw_list->end();
+    const pl::RenderCommandList* lists[2] = {m.upload_list, m.draw_list};
+    m.queue->executeCommandLists(lists, 2, nullptr, 0, nullptr, 0, c.fence.get());
+    c.submitted = submitted = true;
+  };
+
+  // The presenter hands over its guest output image for the length of the
+  // callback, which must submit the commands writing it (on the queue the
+  // presenter uses: the SDK's graphics queue 0, Plume's too).
+  if (present && present->presenter) {
+    auto it = m.resolved.find(present->frontbuffer_base >> 12);
+    if (it == m.resolved.end() || !it->second.image.texture) {
+      m.Note(fmt::format("present: front buffer {:08X} was not resolved", present->frontbuffer_base));
+    } else {
+      TextureEntry& source = it->second;
+      present->presenter->RefreshGuestOutput(
+          source.image.width, source.image.height, present->aspect_x, present->aspect_y,
+          [&](rex::ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+            auto& vulkan_context =
+                static_cast<rex::ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(
+                    context);
+            m.RecordPresent(vulkan_context.image(), vulkan_context.image_ever_written_previously(),
+                            source, present->gamma_ramp);
+            context.SetIs8bpc(true);
+            submit();
+            return true;
+          });
+    }
+  }
+  if (!submitted) submit();
+  if (error) error->clear();
+  if (!resolves) {
+    m.readbacks.clear();
+    return true;
+  }
+  m.queue->waitForCommandFence(c.fence.get());
+  c.submitted = false;
   for (Readback& rb : m.readbacks) {
-    ResolvedImage& out = resolves.emplace_back(std::move(rb.result));
+    ResolvedImage& out = resolves->emplace_back(std::move(rb.result));
     if (!rb.buffer) continue;
     const auto* mapping = static_cast<const uint8_t*>(rb.buffer->map());
     if (!mapping) {
@@ -1905,8 +2212,20 @@ bool Renderer::EndFrame(std::vector<ResolvedImage>& resolves, std::string* error
     rb.buffer->unmap();
   }
   m.readbacks.clear();
-  if (error) error->clear();
   return true;
 }
+
+void Renderer::WatchGuestMemory(rex::memory::Memory* memory) { PageWatch::Get().Attach(memory); }
+
+void Renderer::WaitIdle() {
+  Impl& m = *impl_;
+  for (Impl::FrameContext& c : m.contexts)
+    if (c.submitted) {
+      m.queue->waitForCommandFence(c.fence.get());
+      c.submitted = false;
+    }
+}
+
+void Renderer::SetKeepResolves(bool keep) { impl_->keep_resolves = keep; }
 
 }  // namespace tb2::native

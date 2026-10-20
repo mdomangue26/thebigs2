@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
+#include <map>
 #include <functional>
 #include <string>
 
@@ -29,6 +31,21 @@ void EnsureConfigFile(const std::filesystem::path& config_path);
 // Sets (or adds) `key = "value"` in the config file, keeping everything else.
 void SaveConfigString(const std::filesystem::path& config_path, std::string_view key,
                       std::string_view value);
+
+// Sets `key = literal` (a TOML value: 2, true, "fsi") in the config file,
+// keeping everything else; a commented-out `# key = ...` line (how the
+// template leaves automatic settings) is uncommented, and a key the file
+// lacks is added at its end. std::nullopt comments the key out, so its
+// default applies.
+void SaveConfigValue(const std::filesystem::path& config_path, std::string_view key,
+                     const std::optional<std::string>& literal);
+
+// "value" as a TOML basic string.
+std::string QuoteConfigString(std::string_view value);
+
+// The settings the config file sets (uncommented top-level lines), as TOML
+// literals; the first line wins for a key set twice.
+std::map<std::string, std::string> ReadConfigValues(const std::filesystem::path& config_path);
 
 // True if logs can be written next to the executable.
 bool ExeDirWritable();

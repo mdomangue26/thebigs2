@@ -28,11 +28,13 @@
 #include "first_launch.h"
 #include "frame_stats.h"
 #include "settings.h"
+#include "settings_menu.h"
 #if defined(TB2_RENDER_TRACE)
 #include "render_trace.h"
 #endif
 
 void TB2_RegisterRenderDocCaptureBind();  // renderdoc_capture.cpp
+void TB2_LogRenderTargetPath();           // render_tweaks.cpp
 
 class Thebigs2App : public rex::ReXApp {
  public:
@@ -119,7 +121,20 @@ class Thebigs2App : public rex::ReXApp {
   void OnPostSetup() override {
     rex::ui::RegisterBind("bind_quit", "F10", "Quit the game",
                           [this] { RequestQuit("keyboard"); });
+
+    // The game's settings menu on F4 instead of the SDK's generic cvar
+    // overlay: that one's "Save to config" rewrites thebigs2.toml from scratch
+    // (the comments and every setting it doesn't count as modified are lost).
+    auto* input = static_cast<rex::input::InputSystem*>(runtime()->input_system());
+    tb2::InitSettingsMenu(
+        imgui_drawer(), input, tb2_config_path_,
+        [this](std::function<void()> fn) { app_context().CallInUIThreadDeferred(std::move(fn)); },
+        [this] { RequestQuit("settings menu"); });
+    rex::ui::UnregisterBind("bind_settings");
+    rex::ui::RegisterBind("bind_settings_menu", "F4", "Settings menu",
+                          [] { tb2::ToggleSettingsMenu(); });
     TB2_RegisterRenderDocCaptureBind();
+    TB2_LogRenderTargetPath();
     SetGuestFrameStats(&tb2::GuestFrameStats);
 #if defined(TB2_RENDER_TRACE)
     TB2TraceInit(tb2_user_data_root_ / "traces");
@@ -136,19 +151,32 @@ class Thebigs2App : public rex::ReXApp {
       constexpr uint16_t kCombo =
           rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_START;
       constexpr auto kHold = seconds(2);
+      // Hold Back + Y for a second: the settings menu.
+      constexpr uint16_t kMenuCombo =
+          rex::input::X_INPUT_GAMEPAD_BACK | rex::input::X_INPUT_GAMEPAD_Y;
+      constexpr auto kMenuHold = seconds(1);
       auto* input = static_cast<rex::input::InputSystem*>(runtime()->input_system());
-      steady_clock::time_point held_since{};
-      bool holding = false;
+      steady_clock::time_point held_since{}, menu_since{};
+      bool holding = false, menu_holding = false, menu_toggled = false;
       while (!stop_poller_.load(std::memory_order_relaxed)) {
-        bool pressed = false;
+        bool pressed = false, menu_pressed = false;
         rex::input::X_INPUT_STATE state{};
-        for (uint32_t user = 0; input && user < 4 && !pressed; ++user) {
-          if (input->GetStateForUI(user, &state) == 0 &&
-              (uint16_t(state.gamepad.buttons) & kCombo) == kCombo) {
-            pressed = true;
-          }
+        for (uint32_t user = 0; input && user < 4; ++user) {
+          if (input->GetStateForUI(user, &state) != 0) continue;
+          const uint16_t buttons = uint16_t(state.gamepad.buttons);
+          pressed |= (buttons & kCombo) == kCombo;
+          menu_pressed |= (buttons & kMenuCombo) == kMenuCombo;
         }
         const auto now = steady_clock::now();
+        if (!menu_pressed) {
+          menu_holding = menu_toggled = false;
+        } else if (!menu_holding) {
+          menu_holding = true;
+          menu_since = now;
+        } else if (!menu_toggled && now - menu_since >= kMenuHold) {
+          menu_toggled = true;  // once per hold
+          tb2::ToggleSettingsMenu();
+        }
         if (pressed && !holding) {
           holding = true;
           held_since = now;

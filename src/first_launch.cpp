@@ -15,13 +15,13 @@
 #include <utility>
 #include <vector>
 
-#include <SDL3/SDL.h>
 #include <imgui.h>
 
 #include <rex/logging.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/imgui_drawer.h>
 
+#include "imgui_gamepad.h"
 #include "settings.h"
 
 #if defined(_WIN32)
@@ -142,7 +142,6 @@ class FirstLaunchDialog final : public rex::ui::ImGuiDialog {
     saved_backend_flags_ = io.BackendFlags;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
-    gamepad_ok_ = SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 
     message_ = ShortError(setup_.message);
     places_ = Places(setup_.start_dir);
@@ -156,8 +155,6 @@ class FirstLaunchDialog final : public rex::ui::ImGuiDialog {
   }
 
   ~FirstLaunchDialog() override {
-    for (SDL_Gamepad* pad : pads_) SDL_CloseGamepad(pad);
-    if (gamepad_ok_) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
     ImGuiIO& io = GetIO();
     io.ConfigFlags = saved_config_flags_;
     io.BackendFlags = saved_backend_flags_;
@@ -168,7 +165,7 @@ class FirstLaunchDialog final : public rex::ui::ImGuiDialog {
 
  protected:
   void OnDraw(ImGuiIO& io) override {
-    FeedGamepads(io);
+    gamepads_.Feed(io);
 
     const bool running = status_->running.load();
     if (was_running_ && !running) {
@@ -369,64 +366,11 @@ class FirstLaunchDialog final : public rex::ui::ImGuiDialog {
     if (selected_ok_) message_.clear();
   }
 
-  // ImGui gamepad navigation from SDL gamepads (the SDK's input system isn't
-  // running yet). A = activate, B = back, D-pad / left stick = move.
-  void FeedGamepads(ImGuiIO& io) {
-    if (!gamepad_ok_) return;
-    std::erase_if(pads_, [](SDL_Gamepad* pad) {
-      if (SDL_GamepadConnected(pad)) return false;
-      SDL_CloseGamepad(pad);
-      return true;
-    });
-    int count = 0;
-    if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
-      for (int i = 0; i < count; ++i) {
-        if (!SDL_GetGamepadFromID(ids[i])) {
-          if (SDL_Gamepad* pad = SDL_OpenGamepad(ids[i])) pads_.push_back(pad);
-        }
-      }
-      SDL_free(ids);
-    }
-    static constexpr std::pair<SDL_GamepadButton, ImGuiKey> kButtons[] = {
-        {SDL_GAMEPAD_BUTTON_SOUTH, ImGuiKey_GamepadFaceDown},
-        {SDL_GAMEPAD_BUTTON_EAST, ImGuiKey_GamepadFaceRight},
-        {SDL_GAMEPAD_BUTTON_WEST, ImGuiKey_GamepadFaceLeft},
-        {SDL_GAMEPAD_BUTTON_NORTH, ImGuiKey_GamepadFaceUp},
-        {SDL_GAMEPAD_BUTTON_DPAD_UP, ImGuiKey_GamepadDpadUp},
-        {SDL_GAMEPAD_BUTTON_DPAD_DOWN, ImGuiKey_GamepadDpadDown},
-        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, ImGuiKey_GamepadDpadLeft},
-        {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, ImGuiKey_GamepadDpadRight},
-        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, ImGuiKey_GamepadL1},
-        {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, ImGuiKey_GamepadR1},
-    };
-    for (const auto& [button, key] : kButtons) {
-      bool down = false;
-      for (SDL_Gamepad* pad : pads_) down = down || SDL_GetGamepadButton(pad, button);
-      io.AddKeyEvent(key, down);
-    }
-    float x = 0, y = 0;
-    for (SDL_Gamepad* pad : pads_) {
-      const float px = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX) / 32767.0f;
-      const float py = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY) / 32767.0f;
-      if (std::abs(px) > std::abs(x)) x = px;
-      if (std::abs(py) > std::abs(y)) y = py;
-    }
-    auto stick = [&io](ImGuiKey key, float v) {
-      constexpr float kDead = 0.35f;
-      io.AddKeyAnalogEvent(key, v > kDead, v > kDead ? std::min(1.0f, v) : 0.0f);
-    };
-    stick(ImGuiKey_GamepadLStickLeft, -x);
-    stick(ImGuiKey_GamepadLStickRight, x);
-    stick(ImGuiKey_GamepadLStickUp, -y);
-    stick(ImGuiKey_GamepadLStickDown, y);
-  }
-
   FirstLaunchSetup setup_;
   ExtractStatus* status_;
   ImGuiConfigFlags saved_config_flags_ = 0;
   ImGuiBackendFlags saved_backend_flags_ = 0;
-  bool gamepad_ok_ = false;
-  std::vector<SDL_Gamepad*> pads_;
+  ImGuiGamepads gamepads_;  // the SDK's input system isn't running yet
 
   std::vector<std::pair<std::string, fs::path>> places_;
   fs::path dir_;

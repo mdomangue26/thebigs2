@@ -47,7 +47,8 @@ constexpr const char* kConfigName = "thebigs2.toml";
 
 constexpr const char* kTemplate = R"TOML(# The Bigs 2 - settings
 #
-# Edit while the game is closed. Any setting can also be given on the command
+# Edit while the game is closed, or in game with the settings menu (F4, or
+# hold Back + Y on a controller). Any setting can also be given on the command
 # line for one run, e.g.  thebigs2 --resolution_scale=1
 # Delete this file to get the defaults (and these comments) back.
 
@@ -128,6 +129,9 @@ frame_rate = 30
 # --- Controls ----------------------------------------------------------------
 # Keyboard key that quits (controller: hold Back + Start for 2 seconds).
 bind_quit = "F10"
+
+# Keyboard key that opens the settings menu (controller: hold Back + Y).
+bind_settings_menu = "F4"
 
 # --- Keyboard as controller --------------------------------------------------
 # The keyboard plays as player 1's controller, together with the first pad.
@@ -347,51 +351,121 @@ void EnsureConfigFile(const fs::path& config_path) {
   if (f) f << ConfigTemplate();
 }
 
-void SaveConfigString(const fs::path& config_path, std::string_view key, std::string_view value) {
-  std::string text;
-  {
-    std::ifstream in(config_path, std::ios::binary);
-    std::stringstream ss;
-    ss << in.rdbuf();
-    text = ss.str();
+namespace {
+
+// `key` and the rest of a `key = ...` line (after the "="), if `line` is one:
+// top level, or commented out ("# key = ...") when `commented` is set.
+bool MatchSetting(std::string_view line, std::string_view key, bool commented,
+                  std::string_view* rest_out) {
+  size_t i = line.find_first_not_of(" \t");
+  if (i == std::string_view::npos) return false;
+  line.remove_prefix(i);
+  if (commented) {
+    if (line.empty() || line[0] != '#') return false;
+    line.remove_prefix(1);
+    i = line.find_first_not_of(" \t");
+    if (i == std::string_view::npos) return false;
+    line.remove_prefix(i);
   }
-  // TOML basic string: escape backslashes and quotes (Windows paths).
-  std::string escaped;
-  for (char c : value) {
-    if (c == '\\' || c == '"') escaped += '\\';
-    escaped += c;
+  if (!line.starts_with(key)) return false;
+  line.remove_prefix(key.size());
+  i = line.find_first_not_of(" \t");
+  if (i == std::string_view::npos || line[i] != '=') return false;
+  if (rest_out) *rest_out = line.substr(i + 1);
+  return true;
+}
+
+std::string ReadText(const fs::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
+// The value of a `key = value` line as a TOML literal: up to a trailing
+// comment, outside quotes.
+std::string LiteralOf(std::string_view rest) {
+  std::string out;
+  bool quoted = false, escaped = false;
+  for (char c : rest) {
+    if (!quoted && c == '#') break;
+    if (quoted && !escaped && c == '"') quoted = false;
+    else if (!quoted && c == '"') quoted = true;
+    escaped = quoted && !escaped && c == '\\';
+    out += c;
   }
-  const std::string line = std::string(key) + " = \"" + escaped + "\"";
-  // Replace the first top-level `key = ...` line, else insert at the top.
-  bool replaced = false;
-  std::string result;
-  size_t pos = 0;
-  while (pos < text.size()) {
+  const size_t first = out.find_first_not_of(" \t\r");
+  const size_t last = out.find_last_not_of(" \t\r");
+  return first == std::string::npos ? std::string() : out.substr(first, last - first + 1);
+}
+
+}  // namespace
+
+std::map<std::string, std::string> ReadConfigValues(const fs::path& config_path) {
+  std::map<std::string, std::string> values;
+  std::istringstream in(ReadText(config_path));
+  std::string line;
+  while (std::getline(in, line)) {
+    const size_t i = line.find_first_not_of(" \t");
+    if (i == std::string::npos || line[i] == '#' || line[i] == '[') continue;
+    const size_t eq = line.find('=', i);
+    if (eq == std::string::npos) continue;
+    std::string key = line.substr(i, eq - i);
+    key.erase(key.find_last_not_of(" \t") + 1);
+    if (!values.contains(key)) values[key] = LiteralOf(std::string_view(line).substr(eq + 1));
+  }
+  return values;
+}
+
+void SaveConfigValue(const fs::path& config_path, std::string_view key,
+                     const std::optional<std::string>& literal) {
+  const std::string text = ReadText(config_path);
+  // Lines, without their line breaks.
+  std::vector<std::string> lines;
+  for (size_t pos = 0; pos <= text.size();) {
     size_t end = text.find('\n', pos);
     if (end == std::string::npos) end = text.size();
-    std::string_view cur(text.data() + pos, end - pos);
-    size_t i = cur.find_first_not_of(" \t");
-    std::string_view rest = i == std::string_view::npos ? std::string_view{} : cur.substr(i);
-    if (!replaced && rest.starts_with(key)) {
-      std::string_view after = rest.substr(key.size());
-      size_t j = after.find_first_not_of(" \t");
-      if (j != std::string_view::npos && after[j] == '=') {
-        result += line;
-        replaced = true;
-        pos = end;
-        if (pos < text.size()) result += '\n', ++pos;
-        continue;
-      }
-    }
-    result.append(cur);
-    pos = end;
-    if (pos < text.size()) result += '\n', ++pos;
+    lines.emplace_back(text, pos, end - pos);
+    pos = end + 1;
   }
-  text = replaced ? result : line + "\n" + text;
+  if (!text.empty() && text.back() == '\n') lines.pop_back();
+  const std::string set_line = literal ? std::string(key) + " = " + *literal : std::string();
+  // The key's line, else its commented-out line (the template's form of a
+  // setting left at its default).
+  auto find = [&](bool commented) -> std::optional<size_t> {
+    for (size_t i = 0; i < lines.size(); ++i)
+      if (MatchSetting(lines[i], key, commented, nullptr)) return i;
+    return std::nullopt;
+  };
+  if (const auto i = find(false)) {
+    lines[*i] = literal ? set_line : "# " + lines[*i].substr(lines[*i].find_first_not_of(" \t"));
+  } else if (!literal) {
+    return;  // already at its default
+  } else if (const auto j = find(true)) {
+    lines[*j] = set_line;
+  } else {
+    lines.push_back(set_line);  // a setting the file predates
+  }
+  std::string out_text;
+  for (const auto& l : lines) out_text += l + "\n";
   std::error_code ec;
   fs::create_directories(config_path.parent_path(), ec);
   std::ofstream out(config_path, std::ios::binary | std::ios::trunc);
-  out << text;
+  out << out_text;
+}
+
+void SaveConfigString(const fs::path& config_path, std::string_view key, std::string_view value) {
+  SaveConfigValue(config_path, key, QuoteConfigString(value));
+}
+
+std::string QuoteConfigString(std::string_view value) {
+  // TOML basic string: escape backslashes and quotes (Windows paths).
+  std::string quoted = "\"";
+  for (char c : value) {
+    if (c == '\\' || c == '"') quoted += '\\';
+    quoted += c;
+  }
+  return quoted + "\"";
 }
 
 #if defined(_WIN32)

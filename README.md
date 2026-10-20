@@ -146,7 +146,12 @@ complete, so an interrupted run starts over cleanly. Once extracted, the
 
 ## 4. Settings file
 
-Settings live in **`thebigs2.toml`**:
+Settings live in **`thebigs2.toml`**. The in-game **settings menu** (**F4**,
+or hold **Back + Y** on a controller for a second) edits it: it shows what the
+file sets, saves changes into the same lines (comments stay), and applies the
+frame rate, upscaling and letterbox at once; the rest take effect after a
+restart (*Save and quit*). Start or Ctrl+S saves, B or F4 closes. While it is
+open the game doesn't see the controller. The file itself:
 
 - `~/.config/thebigs2/thebigs2.toml` on Linux (`%APPDATA%\thebigs2\` on Windows),
   written with comments on first launch;
@@ -277,6 +282,7 @@ On the Deck:
 2. *Add a Non-Steam Game to My Library*, pick the AppImage, then switch to
    Game Mode and play. The Deck's controls arrive as an Xbox pad.
 3. Quit with **Back + Start held 2 seconds** (the View and Menu buttons).
+   **Back + Y held a second** opens the settings menu.
 4. On the Deck OLED (90 Hz), set the refresh rate to 60 Hz in the Quick
    Access performance menu, otherwise motion judders.
 
@@ -390,7 +396,8 @@ close the window through the normal shutdown. F10 can be rebound with the
 |---|---|
 | F10 | Quit (`bind_quit`) |
 | F3 | SDK debug overlay, including the game's frame rate |
-| F4 / F7 / Backtick | SDK settings, achievements and console overlays |
+| F4 | Settings menu (`bind_settings_menu`; controller: hold Back + Y). Replaces the SDK's generic settings overlay, whose "Save to config" rewrote thebigs2.toml without its comments |
+| F7 / Backtick | SDK achievements and console overlays |
 | F9 | Capture frames in RenderDoc (only when launched from RenderDoc) |
 | F8 | Record a render trace (trace build only, `-DTB2_RENDER_TRACE=ON`) |
 

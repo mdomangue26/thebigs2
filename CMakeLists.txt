@@ -34,6 +34,7 @@ set(THEBIGS2_SOURCES
     src/native/buffers.cpp
     src/native/shaders.cpp
     src/native/textures.cpp
+    src/native/plume_device.cpp
 )
 
 if(WIN32)
@@ -65,6 +66,26 @@ if(NOT MSVC AND NOT CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     target_compile_options(tb2_xenos PRIVATE -Wno-unused-variable -Wno-unused-function)
 endif()
 target_link_libraries(thebigs2 PRIVATE tb2_xenos)
+
+# Plume (src/native/plume/README.md), the native renderer's rendering API:
+# Vulkan backend only, built against the SDK's Vulkan headers, SDL3 windows.
+# Hidden visibility keeps volk's vkXxx function pointers out of the exports.
+add_library(tb2_plume STATIC src/native/plume/plume_vulkan.cpp)
+target_include_directories(tb2_plume SYSTEM PUBLIC
+    src/native/plume src/native/plume/contrib/volk
+    src/native/plume/contrib/VulkanMemoryAllocator/include)
+target_compile_definitions(tb2_plume PUBLIC PLUME_SDL3_VULKAN_ENABLED)
+target_link_libraries(tb2_plume PUBLIC rex::runtime)
+if(TARGET SDL3::Headers)
+    target_link_libraries(tb2_plume PUBLIC SDL3::Headers)
+else()
+    target_include_directories(tb2_plume SYSTEM PUBLIC "${REXSDK_DIR}/thirdparty/sdl3/include")
+endif()
+set_target_properties(tb2_plume PROPERTIES CXX_VISIBILITY_PRESET hidden)
+if(NOT MSVC AND NOT CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    target_compile_options(tb2_plume PRIVATE -w)
+endif()
+target_link_libraries(thebigs2 PRIVATE tb2_plume)
 
 # A user's disc image is accepted only if its default.xex is the one this
 # build was recompiled from.
@@ -103,7 +124,7 @@ rexglue_setup_target(thebigs2 GPU_PLUGINS xenos)
 # Keep the executable loadable on glibc older than the build machine's, e.g.
 # SteamOS (see src/glibc_compat.h), including the recompiled sources.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    foreach(_t thebigs2 thebigs2_recomp tb2_xenos)
+    foreach(_t thebigs2 thebigs2_recomp tb2_xenos tb2_plume)
         if(TARGET ${_t})
             target_compile_options(${_t} PRIVATE
                 "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/glibc_compat.h")

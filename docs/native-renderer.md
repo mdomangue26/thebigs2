@@ -2,8 +2,11 @@
 
 Status: **Phases 0 (mapping) and 1 (shadow capture) done; phase 2 (resource
 conversion) done except the pipeline cache, which needs the Vulkan device of
-phase 3.** Work happens on the
-`native-renderer` branch. The game still renders through the SDK's Xenos GPU
+phase 3. Restarted 2026-10-20 on [Plume](#rendering-api-plume): Plume runs on
+the SDK's Vulkan device (self-test); phase 3 next.** Work happens on the
+`native-renderer` branch. A first renderer written straight against Vulkan
+(phases 3-6, menus to full frames, live and detached mode, resolution scaling,
+AA options) is kept on the branch `native-renderer-vk` for reference. The game still renders through the SDK's Xenos GPU
 emulator; nothing here changes that yet. Findings: [d3d-map.md](d3d-map.md).
 
 ## Why
@@ -121,6 +124,28 @@ renderer via `OnCreateImmediateDrawer`).
 
 This is a long project — comparable in size to the renderers written for other
 recompilation ports — and each phase is useful on its own.
+
+## Rendering API: Plume
+
+The renderer is written against [Plume](https://github.com/renderbag/plume)
+(RT64's rendering API: Vulkan, D3D12, Metal), copied into `src/native/plume/`
+with local changes (README there). Only its Vulkan backend is built.
+
+- **Device**: Plume wraps the SDK's VkDevice instead of creating its own
+  (`src/native/plume_device.cpp`, local `VulkanExternalDeviceDesc` patch), so
+  the renderer's images can go to the SDK's presenter (ImGui overlays, gamma
+  ramp, frame pacing) and both submit to one queue under the SDK's queue
+  mutex. Plume allocates through VMA.
+- **Shaders**: SPIR-V from the Xenos translator, as before. Plume's D3D12
+  backend only takes DXIL, so a D3D12 path would need SPIR-V -> HLSL -> DXIL at
+  run time; Windows stays on Vulkan.
+- **Check**: `--native_plume_selftest=true` wraps the SDK device at startup
+  and checks a render-target clear read back through a buffer, and a buffer
+  copy. 2026-10-20 (RTX 4060): passes; with `--vulkan_validation_enabled=true`
+  no messages beyond the SDK's own (the same four VUIDs without Plume).
+- Things to watch: Plume bakes the stencil reference into the pipeline (more
+  pipeline variants than with dynamic state); its barrier/layout tracking is
+  still marked as being refined upstream.
 
 ## Phase 2: resource conversion (`src/native/`)
 

@@ -29,6 +29,7 @@
 #include "frame_stats.h"
 #include "settings.h"
 #include "native_capture.h"
+#include "native/plume_device.h"
 #if defined(TB2_RENDER_TRACE)
 #include "render_trace.h"
 #endif
@@ -123,6 +124,7 @@ class Thebigs2App : public rex::ReXApp {
     TB2_RegisterRenderDocCaptureBind();
     SetGuestFrameStats(&tb2::GuestFrameStats);
     tb2::NativeCaptureInit(tb2_user_data_root_ / "captures");
+    tb2::native::PlumeStartupCheck();
 #if defined(TB2_RENDER_TRACE)
     TB2TraceInit(tb2_user_data_root_ / "traces");
 #endif

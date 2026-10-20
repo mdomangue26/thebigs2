@@ -21,7 +21,7 @@ No game data is included. You need your own dump of the disc.
 | `src/frame_stats.cpp` | Frame-rate counter (F3 overlay, log) and the experimental 60 fps unlock (`frame_rate`) |
 | `src/render_trace.cpp`, `src/renderdoc_capture.cpp` | Debug tooling: render-call trace build (F8), RenderDoc capture (F9) |
 | `docs/native-renderer.md`, `docs/d3d-map.md` | Plan and findings for a native Vulkan renderer (`native-renderer` branch) |
-| `src/native_capture.cpp`, `src/native/` | Native renderer work: shadow capture (F6), resource conversion (textures, geometry, shaders to SPIR-V; `src/native/xenos/` is the SDK's shader translator, copied) |
+| `src/native_capture.cpp`, `src/native/` | Native renderer work: shadow capture (F6), resource conversion (textures, geometry, shaders to SPIR-V; `src/native/xenos/` is the SDK's shader translator, copied), Plume on the SDK's Vulkan device (`src/native/plume/`, copied with local changes) |
 | `tools/` | Analysis scripts (call graph, string refs, render-trace generator and summary), `atbat.sh` (scripted gameplay frame for rendering checks), `native_capture_run.sh` (shadow captures while it plays), `native_validate.sh` / `native_contact_sheet.py` (check a capture's SPIR-V, tile its texture previews), `perf/` (GPU command thread benchmark, gdb stack sampler) |
 | `packaging/` | AppImage recipe (`build-appimage.sh`, desktop file, icon; `PROFILE=steamdeck` for the Deck); Windows cross-build (`build-windows.sh`, `windows/` toolchain file and icon) |
 | `game/` | **Your** extracted disc contents (`default.xex` + data). Git-ignored. |

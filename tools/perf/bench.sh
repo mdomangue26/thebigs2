@@ -8,7 +8,7 @@
 # thread (from --fps_log_interval), and the CP's working time per frame.
 cd "$(dirname "$0")/../.."
 N="$1"; shift
-HOLD=60 HOLD_IDLE=${HOLD_IDLE-1} tools/atbat.sh out/perf/b_$N --resolution_scale=1 \
+SIDE=${SIDE:-home} HOLD=60 HOLD_IDLE=${HOLD_IDLE-1} tools/atbat.sh out/perf/b_$N --resolution_scale=1 \
   --render_target_path_vulkan=host --frame_rate=60 --fps_log_interval=5 --cp_frame_stats=true \
   "$@" >/dev/null 2>&1
 L=out/build/linux-amd64-release/logs/$(ls -t out/build/linux-amd64-release/logs | head -1)

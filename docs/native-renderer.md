@@ -400,6 +400,70 @@ Checked 2026-10-20: 8x MSAA + FXAA at 1x renders every draw with no validation
 messages beyond the SDK's own; edges visibly smoother than 4x, the HUD text a
 little softer (`out/perf/plive8` vs `plive6`).
 
+### Fixed after the Deck test of 2026-10-21
+
+- **Missing crowd groups**: D3D splits draws of more than 65,535 vertices
+  into several draw packets - the crowd's long auto-indexed triangle strips
+  go out as 65,534 + ~19,000 vertices, with `VGT_INDX_OFFSET` = 0xFFFC written
+  between them (the second strip restarts two vertices back). The hooks only
+  rendered a draw call with exactly one packet, so those calls (2 per frame
+  in some camera angles) were dropped: whole groups of spectators missing
+  over empty red seats. Each packet is now a draw of its own, with the
+  registers as they were at it (`NativeDraw` in `src/native_capture.cpp`).
+  Checked in `out/perf/pcap9` frame 29 (both split crowd draws): scene within
+  0.13/255 of the emulator (11/255 with the groups missing, `pcap4` frame 8).
+  Live mode logs the first 20 split draws.
+- **Possible AMD-only frame glitches** (one frame of another camera on the
+  Deck): render passes on the same attachment one after another had no
+  barrier between them when the layout didn't change, and Plume's render
+  passes carry no dependencies - no ordering at all. NVIDIA happens to
+  serialize them; RADV may run them concurrently. Every render pass now
+  starts with a barrier on its attachments, as does every resolve into a
+  texture. Desktop: no change in speed (60 fps, 8.3 ms render thread) or
+  image (0.95-1.29/255).
+- **Black frame at strike-outs** (not AMD-only, not the native renderer's
+  fault): on the first frame of the strike-out cameras' depth of field effect
+  the game's blur radius is 0 and it uploads 16 Gaussian weights of 0/0 =
+  NaN (pixel shader c65-c68; offsets c69-c76 all 0) through its material
+  constant upload `sub_82492B08`. The two 640x360 blur passes (ps
+  `A8B2455B5A20DDB6` on the CoC at `1C930000`, `99E61A1AF89C60F3` on the colour
+  at `1C83F000`) end in a saturate, which flushes NaN to 0, and the composite
+  (`1FD240F3A3EB84AA`) turns the whole scene black for one frame. The
+  emulator gets the same constants (`--native_nan_check=true`). Fixed for both
+  in `src/render_tweaks.cpp`: a SetPixelShaderConstantF (`sub_823BC8E8`)
+  upload of 16 NaNs to c65 becomes 1/16 each - with all offsets 0 the blur
+  is a copy, as a zero radius means. Logged as `[render] depth of field blur
+  with NaN weights`; desktop and Deck runs with it: no black frames.
+- **GPU timing queries**: Plume already returns nanoseconds (they were
+  converted twice), and reading the pool back failed (`VK_NOT_READY` flood on
+  RADV) while some resolve slots were never written - unused slots are now
+  written at the end of the frame.
+
+### Diagnostics (live mode)
+
+- Black-frame detector: 16 patches of each presented gameplay frame (300+
+  draws) are read back; a frame much darker than the one before logs
+  `presented frame almost black` with the frame's resolves, the first texel
+  of each small float resolve (luminance chain) and an 8x8 patch from the
+  middle of every color resolve of 64x64 or more, for that frame and the
+  one before - which stage went black.
+- Small float resolves are checked for inf / NaN (`non-finite values`).
+- Resolves of a render target nothing drew this frame or the one before
+  (`not drawn this frame`: EDRAM aliasing) and resolved textures dropped
+  because the CPU wrote their memory are logged.
+- `--native_debug_frames=true` also writes `native_dark_N.txt` and
+  `native_dark_N_before.txt` (every draw with its textures, render target
+  format, blend state and pixel constants, and the resolves) next to the
+  captures, each pixel shader's disassembly (`ps_<hash>.txt`), and a second
+  later the guest memory of the black frame's resolves (`mem_*.bin`; with
+  `--readback_resolve=full` the emulator's copies).
+- `--native_nan_check=true` logs when NaN pixel shader constants appear in
+  the D3D device shadow (works without the native renderer too).
+- Shader translation errors log the shader's hash, size and the error.
+- `tools/atbat.sh` plays as the away team by default (the CPU pitches: about
+  3 strike-outs in the first two minutes of `HOLD`); `SIDE=home` is the old
+  pitching at-bat that the benchmarks use.
+
 ### Fixed along the way (first renderer): wrong vertex shaders
 
 Frames without predicated tiling (`scene_msaa` off: 1x without MSAA, every 2x

@@ -1194,7 +1194,8 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
   }
 
   assert_unhandled_case(instr.scalar_opcode);
-  EmitTranslationError("Unknown ALU scalar operation");
+  EmitTranslationError(
+      ("Unknown ALU scalar operation " + std::to_string(uint32_t(instr.scalar_opcode))).c_str());
   return spv::NoResult;
 }
 

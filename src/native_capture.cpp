@@ -117,6 +117,9 @@ REXCVAR_DEFINE_BOOL(native_sync_frames, false, "The Bigs 2/Debug",
                     "flight)");
 REXCVAR_DEFINE_STRING(native_debug_skip_draws, "", "The Bigs 2/Debug",
                       "Native renderer: FIRST-END, draws of each frame not drawn (bisecting)");
+REXCVAR_DEFINE_BOOL(native_nan_check, false, "The Bigs 2/Debug",
+                    "Log draws whose pixel shader constants (D3D device shadow) hold a NaN - "
+                    "works with the emulator too");
 REXCVAR_DEFINE_BOOL(native_debug_frames, false, "The Bigs 2/Debug",
                     "Native renderer: dump the draw logs of frames with an unusually bright "
                     "patch next to the captures");
@@ -204,6 +207,7 @@ constexpr uint32_t RB_SURFACE_INFO = 0x2000, RB_COLOR_INFO = 0x2001, RB_DEPTH_IN
 
 struct DrawPacket {
   uint32_t packet = 0;      // ring address
+  uint32_t reg_index = 0;   // Parsed::regs written before this packet
   uint32_t initiator = 0;   // VGT_DRAW_INITIATOR
   uint32_t index_base = 0;  // DRAW_INDX with DMA indices
   uint32_t index_size = 0;
@@ -326,6 +330,7 @@ void ParsePm4(const Guest& g, uint32_t p, uint32_t end, Parsed& out) {
       } else if (op == 0x22 && count >= 2) {  // DRAW_INDX
         DrawPacket d;
         d.packet = p;
+        d.reg_index = uint32_t(out.regs.size());
         d.initiator = g.U32(p + 8);
         if (count >= 4) {
           d.index_base = g.U32(p + 12);
@@ -335,6 +340,7 @@ void ParsePm4(const Guest& g, uint32_t p, uint32_t end, Parsed& out) {
       } else if (op == 0x36 && count >= 1) {  // DRAW_INDX_2
         DrawPacket d;
         d.packet = p;
+        d.reg_index = uint32_t(out.regs.size());
         d.initiator = g.U32(p + 4);
         d.inline_indices = true;
         out.draws.push_back(d);
@@ -909,6 +915,20 @@ void CollectResources(const Guest& g, uint32_t device, const Parsed& parsed) {
 
 uint32_t g_index_offset = 0;  // VGT_INDX_OFFSET, set by the draws from their arguments
 
+// A draw call's packets and the register writes between them (logs).
+std::string DescribePackets(const Parsed& parsed) {
+  std::string n = fmt::format("{} register writes:", parsed.regs.size());
+  for (size_t k = 0; k < parsed.draws.size(); ++k) {
+    const DrawPacket& d = parsed.draws[k];
+    n += fmt::format(" {:08X} init {:08X} idx {:08X}/{:08X}", d.packet, d.initiator, d.index_base,
+                     d.index_size);
+    if (k + 1 == parsed.draws.size()) break;
+    for (size_t i = d.reg_index; i < parsed.draws[k + 1].reg_index && i < d.reg_index + 16; ++i)
+      n += fmt::format(" [{:04X}={:08X}]", parsed.regs[i].reg, parsed.regs[i].value);
+  }
+  return n;
+}
+
 // Index registers (register * 4 + component) a vertex shader's fetches use
 // after an instruction wrote them, e.g. the instancing in the crowd shaders:
 // raw vertex indices don't bound those fetches. From the microcode
@@ -1105,6 +1125,10 @@ struct Command {
   Type type = Type::kDraw;
   bool tiling = false, has_rect = false, has_point = false, readback = false, capturing = false;
   bool live = false;  // BeginFrame: rendering every frame (resolves stay valid across frames)
+  bool own_index_offset = false;  // index_offset set by the caller (split draws)
+  // Draw: register values as at this packet of a call that sent several
+  // (Batch::overrides [overrides, overrides + override_count)).
+  uint32_t overrides = 0, override_count = 0;
   bool has_shadow = false, has_ramp = false;
   uint32_t shadow = 0;    // offset of the shadow copy in Batch::bytes
   uint32_t ring_end = 0;  // Batch::ring entries before this are applied first
@@ -1123,14 +1147,23 @@ struct Command {
   uint32_t unknown_shaders = 0, discontinuities = 0, segments = 0, shader_stale = 0;
 };
 
+// A register's value for one packet of a split draw: `value`, or (previous)
+// what it was before the draw call.
+struct RegOverride {
+  uint32_t reg, value;
+  bool previous;
+};
+
 struct Batch {
   std::vector<Command> commands;
   std::vector<uint8_t> bytes;
   std::vector<std::pair<uint32_t, uint32_t>> ring;  // (register, value) in stream order
+  std::vector<RegOverride> overrides;
   void Clear() {
     commands.clear();
     bytes.clear();
     ring.clear();
+    overrides.clear();
   }
 };
 
@@ -1308,7 +1341,15 @@ void WorkerExecute(const Batch& batch) {
   for (const Command& c : batch.commands) {
     apply_ring(c.ring_end);
     auto& regs = *(w.regs ? w.regs : (w.regs = std::make_unique<rex::graphics::RegisterFile>()));
+    // Split draws: registers the call writes after this packet, as they were
+    // before it (the register file still holds the previous draw's state).
+    std::vector<std::pair<uint32_t, uint32_t>> at_packet;
+    for (uint32_t i = 0; i < c.override_count; ++i) {
+      const RegOverride& o = batch.overrides[c.overrides + i];
+      at_packet.emplace_back(o.reg, o.previous ? regs[o.reg] : o.value);
+    }
     if (c.has_shadow) FillRegisters(batch, c);
+    for (auto [reg, value] : at_packet) regs[reg] = value;
     switch (c.type) {
       case Command::Type::kBeginFrame:
         WorkerBeginFrame(c);
@@ -1418,7 +1459,7 @@ void Record(Command c, const Guest& g, uint32_t device) {
     b.bytes.insert(b.bytes.end(), src, src + (kShadowEnd - kShadowFirst));
   }
   c.tiling = g_tiling;
-  c.index_offset = g_index_offset;
+  if (!c.own_index_offset) c.index_offset = g_index_offset;
   c.ring_end = uint32_t(b.ring.size());
   b.commands.push_back(c);
   if (b.commands.size() >= 64) FlushCommands();
@@ -1489,19 +1530,49 @@ void BeginNativeFrame(const Guest& g) {
   g_render_frame = true;
 }
 
-void NativeDraw(const Guest& g, uint32_t device, const Parsed& parsed) {
-  if (!g_render_frame || parsed.draws.size() != 1) return;
+// A D3D draw call can send several draw packets: D3D splits draws of more
+// than 65,535 vertices (the crowd's long auto-indexed strips) into packets,
+// with register writes between them (the index offset). Each packet becomes a
+// draw with the registers as they were at it.
+void NativeDraw(const Guest& g, uint32_t device, const Parsed& parsed,
+                uint32_t index_offset_before) {
+  if (!g_render_frame || parsed.draws.empty()) return;
   if (!g_current_shader[0] || !g_current_shader[1]) {
     ++g_native_unknown_shaders;
     return;
   }
-  const DrawPacket& d = parsed.draws.back();
-  Command c;
-  c.type = Command::Type::kDraw;
-  c.vs = &g_ucode[g_current_shader[0]];
-  c.ps = &g_ucode[g_current_shader[1]];
-  c.draw = {d.initiator, d.index_base, d.index_size};
-  Record(c, g, device);
+  for (size_t k = 0; k < parsed.draws.size(); ++k) {
+    const DrawPacket& d = parsed.draws[k];
+    Command c;
+    c.type = Command::Type::kDraw;
+    c.vs = &g_ucode[g_current_shader[0]];
+    c.ps = &g_ucode[g_current_shader[1]];
+    c.draw = {d.initiator, d.index_base, d.index_size};
+    if (k + 1 < parsed.draws.size()) {
+      // The last write before this packet, of each register written after it.
+      auto before = [&](uint32_t reg) -> const RegWrite* {
+        for (size_t i = d.reg_index; i-- > 0;)
+          if (parsed.regs[i].reg == reg) return &parsed.regs[i];
+        return nullptr;
+      };
+      Batch& b = *g_batch;
+      c.overrides = uint32_t(b.overrides.size());
+      std::set<uint32_t> done;
+      for (size_t i = d.reg_index; i < parsed.regs.size(); ++i) {
+        const uint32_t reg = parsed.regs[i].reg;
+        if (!done.insert(reg).second) continue;
+        const RegWrite* w = before(reg);
+        if (reg == 0x2102) {  // VGT_INDX_OFFSET travels in the command
+          c.own_index_offset = true;
+          c.index_offset = w ? w->value : index_offset_before;
+          continue;
+        }
+        b.overrides.push_back({reg, w ? w->value : 0, w == nullptr});
+      }
+      c.override_count = uint32_t(b.overrides.size()) - c.overrides;
+    }
+    Record(c, g, device);
+  }
 }
 
 // The emulator's results of the frame's resolves, for comparison: with the
@@ -1642,16 +1713,23 @@ DrawArgs BeginDraw(PPCContext& ctx, uint8_t* base, bool indexed) {
 
 void EndDraw(const DrawArgs& a, uint8_t* base) {
   Guest g{base};
+  const uint32_t index_offset_before = g_index_offset;
   if (!Capturing()) {  // live rendering only: no checks
     Scan(g, RingPos(g, a.device));
     const Parsed parsed = TakePending();
+    if (parsed.draws.size() > 1) {
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 20)
+        REXLOG_INFO("[native] draw call with {} draw packets: {}", parsed.draws.size(),
+                    DescribePackets(parsed));
+    }
     for (const RegWrite& w : parsed.regs) {
       NoteRingRegister(w.reg, w.value);
       if (w.reg == 0x2102) g_index_offset = w.value;
     }
     TrackDrawShaders(g, a.device, parsed,
                      parsed.draws.empty() ? 0 : parsed.draws.back().initiator & 0x3F);
-    NativeDraw(g, a.device, parsed);
+    NativeDraw(g, a.device, parsed, index_offset_before);
     return;
   }
   Frame& f = g_frame;
@@ -1661,12 +1739,8 @@ void EndDraw(const DrawArgs& a, uint8_t* base) {
   const Parsed parsed = TakePending();
   if (parsed.draws.size() != 1) {
     ++f.bad_draw_packets;
-    std::string n = fmt::format("B D {}: {} draw packets, {} register writes:", f.draws - 1,
-                                parsed.draws.size(), parsed.regs.size());
-    for (const DrawPacket& d : parsed.draws)
-      n += fmt::format(" {:08X} init {:08X} idx {:08X}/{:08X}", d.packet, d.initiator,
-                       d.index_base, d.index_size);
-    f.events.push_back(n);
+    f.events.push_back(fmt::format("B D {}: {} draw packets: {}", f.draws - 1,
+                                   parsed.draws.size(), DescribePackets(parsed)));
   }
   for (auto& note : parsed.notes) f.events.push_back(fmt::format("N D {}", note));
 
@@ -1698,7 +1772,7 @@ void EndDraw(const DrawArgs& a, uint8_t* base) {
   TrackDrawShaders(g, a.device, parsed,
                    parsed.draws.empty() ? 0 : parsed.draws.back().initiator & 0x3F);
   CheckGeometry(g, a.device, parsed);
-  NativeDraw(g, a.device, parsed);
+  NativeDraw(g, a.device, parsed, index_offset_before);
 
   // GPU state as rebuilt from the stream, against the shadow.
   for (auto& [reg, mv] : g_mirror) {
@@ -1825,9 +1899,6 @@ void NativeCaptureShutdown() {
 }
 
 void NativeCaptureOnSwap(uint8_t* base, uint32_t front_buffer) {
-#if !defined(_WIN32)
-  if (g_signal.exchange(false, std::memory_order_relaxed)) Arm();
-#endif
   if (!g_live.load(std::memory_order_relaxed) && !g_live_failed && REXCVAR_GET(native_renderer)) {
     std::lock_guard lock(g_mutex);
     StartLive();
@@ -1842,10 +1913,32 @@ void NativeCaptureOnSwap(uint8_t* base, uint32_t front_buffer) {
 
 // sub_824DA698 DrawVertices / sub_824DAA88 DrawIndexedVertices (device in r3):
 // flush the dirty shadow state into the ring, then write the draw packet.
+namespace tb2 {
+// native_nan_check: pixel shader constants c0-c127 of the draw's device shadow.
+void CheckNanConstants(uint32_t device, uint8_t* base) {
+  static std::atomic<int> logged{0};
+  const Guest g{base};
+  uint32_t first = 0, count = 0;
+  for (uint32_t i = 0; i < 128 * 4; ++i) {
+    const uint32_t v = g.U32(device + kAluConstants + (256 * 4 + i) * 4);
+    if ((v & 0x7F800000u) == 0x7F800000u && (v & 0x7FFFFFu)) {
+      if (!count++) first = i;
+    }
+  }
+  // Logged when NaNs appear (they stay in the shadow until overwritten).
+  static uint32_t previous = 0;
+  if (count && count != previous && logged.fetch_add(1) < 100)
+    REXLOG_WARN("[native] draws from here on have {} NaN pixel shader constants (first c{}.{})",
+                count, first / 4, "xyzw"[first % 4]);
+  previous = count;
+}
+}  // namespace tb2
+
 extern "C" REX_FUNC(__imp__sub_824DA698);
 extern "C" REX_FUNC(sub_824DA698) {
   TB2_TRACE_HOOKED(0x824DA698);
   g_device.store(ctx.r3.u32, std::memory_order_relaxed);
+  if (REXCVAR_GET(native_nan_check)) tb2::CheckNanConstants(ctx.r3.u32, base);
   if (!Tracking()) {
     [[clang::musttail]] return __imp__sub_824DA698(ctx, base);
   }

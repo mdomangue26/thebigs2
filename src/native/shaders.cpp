@@ -2,7 +2,11 @@
 
 #include "shaders.h"
 
+#include <atomic>
+
 #include <xxhash.h>
+
+#include <rex/logging.h>
 
 #include <rex/string/buffer.h>
 
@@ -77,7 +81,21 @@ SpirvShader::Translation* ShaderLibrary::Translate(
     SpirvShader& shader, SpirvShaderTranslator::Modification modification) {
   bool is_new = false;
   SpirvShader::Translation* t = shader.GetOrCreateTranslation(modification.value, &is_new);
-  if (is_new) translator_->TranslateAnalyzedShader(*t);
+  if (is_new) {
+    translator_->TranslateAnalyzedShader(*t);
+    if (!t->errors().empty()) {
+      // Which shader (its microcode next to the logs: --native_debug_frames dumps
+      // pixel shaders' disassembly by this hash).
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 20)
+        REXLOG_WARN("[native] {} shader {:016X} ({} dwords, modification {:016X}): {} "
+                    "translation error(s), first: {}{}",
+                    shader.type() == xg::xenos::ShaderType::kVertex ? "vertex" : "pixel",
+                    shader.ucode_data_hash(), shader.ucode_dword_count(), modification.value,
+                    t->errors().size(), t->errors().front().message,
+                    t->is_valid() ? "" : " (draws with it are skipped)");
+    }
+  }
   return t->is_valid() ? t : nullptr;
 }
 

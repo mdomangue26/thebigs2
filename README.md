@@ -17,7 +17,7 @@ No game data is included. You need your own dump of the disc.
 | `src/hooks.cpp` | Game-specific runtime fixes (ad server, `XeCryptMd5*`, save listing) |
 | `src/settings.cpp` | Settings file template, display mode, disc-image (.iso) support |
 | `src/first_launch.cpp` | First-launch setup screen (ImGui): pick the disc image, extract it |
-| `assets/fonts/` | Roboto (Apache 2.0), embedded for the setup screen |
+| `assets/fonts/` | Roboto (Apache 2.0) for the setup screen; Barlow Condensed (SIL OFL 1.1) for the settings menu and the F3 overlay |
 | `src/frame_stats.cpp` | Frame-rate counter (F3 overlay, log) and the experimental 60 fps unlock (`frame_rate`) |
 | `src/render_trace.cpp`, `src/renderdoc_capture.cpp` | Debug tooling: render-call trace build (F8), RenderDoc capture (F9) |
 | `docs/native-renderer.md` | Plan and findings for a native Vulkan renderer |
@@ -81,6 +81,8 @@ these fixes on a local branch (`fix/stability`, not in the upstream SDK):
 | 87978cb | Write-watch faults no longer parse `/proc/self/maps` under the global lock | Every game write to GPU-watched memory stalls the GPU thread and other game threads (~20% of the GPU thread's frame time) |
 | 8088994 | Shared memory validity checked without the global lock | The GPU thread contends with game threads on every draw |
 | e806d48 | Cheaper per-draw constants and cvar check; `cp_frame_stats` | ~10% more GPU thread time per frame |
+| 46f7329 | No build-stamp watermark under the F3 overlay | Debug text over the bottom of the screen while F3 is open |
+| c2f9c1e | Controller button remapping (`padbind_*`) | The settings menu's Controller page and the `padbind_*` settings do nothing |
 
 With an unpatched SDK the game still runs; use `resolution_scale = 1` and
 leave `frame_rate` at 30.
@@ -150,8 +152,11 @@ Settings live in **`thebigs2.toml`**. The in-game **settings menu** (**F4**,
 or hold **Back + Y** on a controller for a second) edits it: it shows what the
 file sets, saves changes into the same lines (comments stay), and applies the
 frame rate, upscaling and letterbox at once; the rest take effect after a
-restart (*Save and quit*). Start or Ctrl+S saves, B or F4 closes. While it is
-open the game doesn't see the controller. The file itself:
+restart (*Save and quit*). It looks like the game's own menus: LB / RB (or
+Page Up / Page Down) switch between Display, Graphics, Controls, Controller
+and Keyboard; up / down pick a setting, left / right (or A) change it, A /
+Enter edits a key. Start or Ctrl+S saves, Y saves and quits, B or F4 closes.
+While it is open the game doesn't see the controller. The file itself:
 
 - `~/.config/thebigs2/thebigs2.toml` on Linux (`%APPDATA%\thebigs2\` on Windows),
   written with comments on first launch;
@@ -179,6 +184,7 @@ open the game doesn't see the controller. The file itself:
 | `bind_quit` | `"F10"` | Quit key |
 | `mnk_mode` | `true` | Keyboard plays as player 1's controller (alongside the first pad) |
 | `keybind_*` | see below | Keyboard bindings for each controller input |
+| `padbind_*` | the button itself | Controller button remapping (see below) |
 
 Any setting can also be passed for one run as `--name=value`.
 
@@ -202,10 +208,23 @@ settings file lists every accepted key name.
 
 Holding Back + Start for 2 seconds quits from the keyboard too.
 
+### Controller buttons
+
+Each controller button can press a different game button: `padbind_a`,
+`_b`, `_x`, `_y`, `_lb`, `_rb`, `_lt`, `_rt`, `_back`, `_start`, `_ls`, `_rs`
+(stick clicks), `_up`, `_down`, `_left`, `_right` (d-pad) name the game button
+that physical button presses: `A`, `B`, `X`, `Y`, `LB`, `RB`, `LT`, `RT`,
+`Back`, `Start`, `LS`, `RS`, `Up`, `Down`, `Left`, `Right`, or `None` to turn
+it off (e.g. `padbind_a = "B"` and `padbind_b = "A"` swap A and B). A trigger
+mapped to a button presses it past a light pull; a button mapped to a trigger
+pulls it fully. It applies to every controller, not the keyboard (which has
+its own keys), after a restart. The settings menu's Controller page edits
+these.
+
 Settings files are only written on first launch, so one from an older build
-lacks newer settings. The frame rate section is added to such files
-automatically on the next launch (an old `fps_60 = true` becomes
-`frame_rate = 60`); for other new settings the defaults apply, and you can add
+lacks newer settings. The frame rate and controller button sections are
+added to such files automatically on the next launch (an old `fps_60 = true`
+becomes `frame_rate = 60`); for other new settings the defaults apply, and you can add
 the lines by hand or delete the file to get a fresh one with every setting and
 its comments.
 

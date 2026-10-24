@@ -29,6 +29,7 @@
 #include "frame_stats.h"
 #include "settings.h"
 #include "settings_menu.h"
+#include "ui_theme.h"
 #if defined(TB2_RENDER_TRACE)
 #include "render_trace.h"
 #endif
@@ -245,7 +246,14 @@ class Thebigs2App : public rex::ReXApp {
   }
 
   // The setup screen's fonts (Roboto at a few sizes; first_launch.cpp).
-  void OnConfigureFonts(ImFontAtlas* atlas) override { tb2::AddFirstLaunchFonts(atlas); }
+  void OnConfigureFonts(ImFontAtlas* atlas) override {
+    tb2::AddFirstLaunchFonts(atlas);
+    tb2::theme::AddFonts(atlas);
+  }
+  // The game's look for every overlay (ui_theme.h).
+  void OnConfigureStyle(ImGuiStyle& imgui_style, rex::ui::Style& ui_style) override {
+    tb2::theme::ConfigureStyle(imgui_style, ui_style);
+  }
 
   // No game folder: extract the disc image once, into game/ next to a portable
   // AppImage or else the user data folder (~/.local/share/thebigs2/game), then

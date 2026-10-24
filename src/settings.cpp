@@ -242,6 +242,32 @@ bool SteamDeckProfile() {
 
 namespace {
 
+// The controller remapping section (SDK padbind_*), at the end of the
+// template and appended to settings files written before it existed.
+constexpr const char* kControllerSection = R"TOML(
+# --- Controller buttons ------------------------------------------------------
+# What each button of the controller presses in the game, for every
+# controller (the keyboard has its own keys above). Values: A, B, X, Y, LB,
+# RB, LT, RT, Back, Start, LS, RS (stick clicks), Up, Down, Left, Right
+# (d-pad), or None to turn a button off. Also in the settings menu (F4).
+padbind_a = "A"
+padbind_b = "B"
+padbind_x = "X"
+padbind_y = "Y"
+padbind_lb = "LB"
+padbind_rb = "RB"
+padbind_lt = "LT"
+padbind_rt = "RT"
+padbind_back = "Back"
+padbind_start = "Start"
+padbind_ls = "LS"
+padbind_rs = "RS"
+padbind_up = "Up"
+padbind_down = "Down"
+padbind_left = "Left"
+padbind_right = "Right"
+)TOML";
+
 // Appended to settings files written by older versions that lack it.
 constexpr const char* kFrameRateSection = R"TOML(
 # --- Frame rate --------------------------------------------------------------
@@ -267,7 +293,7 @@ constexpr const char* kSteamDeckHeader = R"TOML(# Steam Deck build. These defaul
 
 // The template with the Steam Deck values (see kSteamDeckHeader).
 std::string ConfigTemplate() {
-  std::string text = kTemplate;
+  std::string text = std::string(kTemplate) + kControllerSection;
   const size_t gpu = text.find("@GPU_BACKEND@");
 #if defined(_WIN32)
   text.replace(gpu, 13,
@@ -316,6 +342,29 @@ void UpgradeConfigFile(const fs::path& config_path) {
     std::stringstream ss;
     ss << in.rdbuf();
     text = ss.str();
+  }
+  {
+    // The controller section's lines the file doesn't have yet (the settings
+    // menu may already have written some).
+    std::string section, line;
+    std::istringstream in(kControllerSection);
+    bool any = false;
+    while (std::getline(in, line)) {
+      const size_t eq = line.find(" = ");
+      if (eq != std::string::npos && line[0] != '#') {
+        if (HasSetting(text, line.substr(0, eq))) continue;
+        any = true;
+      }
+      section += line + '\n';
+    }
+    if (any) {
+      std::ofstream out(config_path, std::ios::binary | std::ios::app);
+      if (out) {
+        if (!text.empty() && text.back() != '\n') out << '\n';
+        out << "\n# Added by a newer version of the game." << section;
+        text += section;
+      }
+    }
   }
   if (HasSetting(text, "frame_rate")) return;
   // frame_rate replaces fps_60: carry an existing `fps_60 = true` over.

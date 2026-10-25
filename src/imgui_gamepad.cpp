@@ -28,7 +28,10 @@ void ImGuiGamepads::Feed(ImGuiIO& io) {
   int count = 0;
   if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
     for (int i = 0; i < count; ++i) {
-      if (!SDL_GetGamepadFromID(ids[i])) {
+      // Our own reference even when the SDK's input driver has the pad open
+      // already (SDL counts opens; SDL_GetGamepadFromID would return its).
+      if (std::none_of(pads_.begin(), pads_.end(),
+                       [id = ids[i]](SDL_Gamepad* pad) { return SDL_GetGamepadID(pad) == id; })) {
         if (SDL_Gamepad* pad = SDL_OpenGamepad(ids[i])) pads_.push_back(pad);
       }
     }

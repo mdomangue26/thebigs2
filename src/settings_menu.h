@@ -1,4 +1,5 @@
-// thebigs2 - in-game settings menu (F4, or hold Back + Y on a controller).
+// thebigs2 - in-game settings menu (F4, hold Back + Y on a controller, or
+// RECOMP SETTINGS on the main menu: main_menu_entry.cpp).
 //
 // Edits thebigs2.toml, the same file as by hand: shows the values the file
 // sets (or the defaults), and Save writes the changed ones into their lines,
@@ -29,5 +30,7 @@ void InitSettingsMenu(rex::ui::ImGuiDrawer* drawer, rex::input::InputSystem* inp
 
 // Opens the menu, or closes it (discarding unsaved changes). Any thread.
 void ToggleSettingsMenu();
+// Opens the menu if it isn't open (the main menu's RECOMP SETTINGS). Any thread.
+void OpenSettingsMenu();
 
 }  // namespace tb2

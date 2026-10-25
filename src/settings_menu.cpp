@@ -634,4 +634,11 @@ void ToggleSettingsMenu() {
   });
 }
 
+void OpenSettingsMenu() {
+  if (!g_state.drawer || !g_state.post_to_ui) return;
+  g_state.post_to_ui([] {
+    if (!g_menu) g_menu = new SettingsMenu(g_state.drawer);
+  });
+}
+
 }  // namespace tb2

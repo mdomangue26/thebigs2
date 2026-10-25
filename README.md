@@ -148,8 +148,9 @@ complete, so an interrupted run starts over cleanly. Once extracted, the
 
 ## 4. Settings file
 
-Settings live in **`thebigs2.toml`**. The in-game **settings menu** (**F4**,
-or hold **Back + Y** on a controller for a second) edits it: it shows what the
+Settings live in **`thebigs2.toml`**. The in-game **settings menu** (**RECOMP
+SETTINGS** near the bottom of the main menu, **F4** anywhere, or hold **Back +
+Y** on a controller for a second) edits it: it shows what the
 file sets, saves changes into the same lines (comments stay), and applies the
 frame rate, upscaling and letterbox at once; the rest take effect after a
 restart (*Save and quit*). It looks like the game's own menus: LB / RB (or
@@ -301,7 +302,8 @@ On the Deck:
 2. *Add a Non-Steam Game to My Library*, pick the AppImage, then switch to
    Game Mode and play. The Deck's controls arrive as an Xbox pad.
 3. Quit with **Back + Start held 2 seconds** (the View and Menu buttons).
-   **Back + Y held a second** opens the settings menu.
+   **Back + Y held a second** (or RECOMP SETTINGS on the main menu) opens
+   the settings menu.
 4. On the Deck OLED (90 Hz), set the refresh rate to 60 Hz in the Quick
    Access performance menu, otherwise motion judders.
 
@@ -407,8 +409,10 @@ SDK commit a52de02 (see *SDK fixes* in section 1); with an unpatched SDK use
 
 ### Quitting and hotkeys
 
-Press **F10**, or hold **Back + Start** on a controller for 2 seconds. Both
-close the window through the normal shutdown. F10 can be rebound with the
+Press **F10**, hold **Back + Start** on a controller for 2 seconds, or pick
+**EXIT GAME** at the bottom of the main menu. All of them close the window
+through the normal shutdown. (The main menu has no XBOX LIVE entry: there is
+no online service.) F10 can be rebound with the
 `bind_quit` setting (e.g. `--bind_quit=Escape`).
 
 | Key | Does |

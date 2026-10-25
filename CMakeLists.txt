@@ -27,6 +27,7 @@ set(THEBIGS2_SOURCES
     src/hooks.cpp
     src/renderdoc_capture.cpp
     src/settings.cpp
+    src/main_menu_entry.cpp
     src/settings_menu.cpp
     src/ui_theme.cpp
     src/imgui_gamepad.cpp

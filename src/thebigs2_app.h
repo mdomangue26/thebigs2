@@ -27,6 +27,7 @@
 
 #include "first_launch.h"
 #include "frame_stats.h"
+#include "main_menu_entry.h"
 #include "settings.h"
 #include "settings_menu.h"
 #include "ui_theme.h"
@@ -119,9 +120,11 @@ class Thebigs2App : public rex::ReXApp {
   // SDK's normal shutdown (TerminateTitle + log flush):
   //   - keyboard: F10 (rebindable via the bind_quit setting)
   //   - controller: hold Back + Start for 2 seconds
+  //   - EXIT GAME on the main menu
   void OnPostSetup() override {
     rex::ui::RegisterBind("bind_quit", "F10", "Quit the game",
                           [this] { RequestQuit("keyboard"); });
+    tb2::InitMainMenuEntries([this] { RequestQuit("main menu"); });
 
     // The game's settings menu on F4 instead of the SDK's generic cvar
     // overlay: that one's "Save to config" rewrites thebigs2.toml from scratch

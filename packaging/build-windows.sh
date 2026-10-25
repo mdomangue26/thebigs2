@@ -5,10 +5,10 @@
 #
 # Needs:
 #   - clang-20 / lld / llvm-rc-20 (the Linux build's toolchain)
-#   - the MSVC CRT + Windows SDK from xwin, in XWIN_DIR
+#   - the MSVC CRT + Windows SDK from xwin, in XWIN_DIR (default ~/msvc-sdk)
 #     (xwin --accept-license --arch x86_64 splat --output <dir>)
 #   - the ReXGlue SDK built for Windows with the same toolchain, in
-#     REXSDK_WIN (default ~/rexsdk-install-win; see README "Windows build")
+#     REXSDK_WIN (default ~/rexsdk-install-win; see docs/BUILDING.md)
 #   - the host (Linux) SDK's rexglue for codegen (~/rexsdk-install/bin)
 #   - cabextract, zip
 #

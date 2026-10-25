@@ -3,7 +3,8 @@
 # The MSVC CRT and Windows SDK come from xwin
 # (https://github.com/Jake-Shadle/xwin):
 #   xwin --accept-license --arch x86_64 splat --output <dir>
-# and are found through XWIN_DIR (cache variable or environment variable).
+# and are found through XWIN_DIR (cache variable or environment variable;
+# default ~/msvc-sdk).
 #
 # The driver is clang++ in GNU mode targeting x86_64-pc-windows-msvc, the same
 # compiler front end the SDK's Windows presets use (clang++ on Windows).
@@ -16,7 +17,7 @@ if(NOT XWIN_DIR)
     if(DEFINED ENV{XWIN_DIR})
         set(XWIN_DIR "$ENV{XWIN_DIR}")
     else()
-        set(XWIN_DIR "/mnt/Games/Non-Steam/msvc-sdk")
+        set(XWIN_DIR "$ENV{HOME}/msvc-sdk")
     endif()
 endif()
 set(XWIN_DIR "${XWIN_DIR}" CACHE PATH "xwin splat output (MSVC CRT + Windows SDK)")

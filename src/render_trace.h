@@ -4,7 +4,7 @@
 // the engine's renderlib) is wrapped by generated code that calls
 // TB2TraceHit. Press F8 (or `kill -USR2 <pid>` on Linux) to record the next
 // frame(s): call counts, callers and the exact call sequence, written to
-// <user data>/traces/. See docs/native-renderer.md.
+// <user data>/traces/.
 #pragma once
 
 #include <cstdint>

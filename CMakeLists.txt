@@ -64,7 +64,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/game/default.xex")
                  "${CMAKE_CURRENT_SOURCE_DIR}/game/default.xex")
 endif()
 
-# Render call tracing for the native-renderer work (docs/native-renderer.md).
+# Render call tracing (debug build option).
 # Wraps every function in the XDK D3D library and the engine's renderlib with a
 # call counter; F8 records a frame. Off by default (adds ~2,000 wrappers).
 option(TB2_RENDER_TRACE "Build with render call tracing (F8)" OFF)

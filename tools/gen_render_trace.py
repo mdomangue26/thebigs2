@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate call-counting wrappers for every recompiled function in the given
-guest address ranges (render tracing, see docs/native-renderer.md).
+guest address ranges (render tracing: CMake option TB2_RENDER_TRACE).
 
   gen_render_trace.py <generated_dir> <out.cpp> name:lo-hi [name:lo-hi ...]
 
